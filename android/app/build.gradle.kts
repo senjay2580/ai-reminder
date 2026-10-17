@@ -31,18 +31,18 @@ android {
     }
     kotlinOptions { jvmTarget = "17" }
 
-    // 固定签名:覆盖安装要求新旧 APK 同一签名,CI 和本地构建都用这一个
+    // 固定签名:覆盖安装要求新旧 APK 同一签名。仓库公开,keystore 与密码只在仓库加密 secret 里,
+    // CI 解码后经环境变量传入;缺了 assembleRelease 直接失败,不会悄悄换签名。本地备份在 .secrets/
     signingConfigs {
         create("app") {
-            storeFile = file("reminder.keystore")
-            storePassword = "aireminder"
+            storeFile = System.getenv("KEYSTORE_FILE")?.let(::file)
+            storePassword = System.getenv("KEYSTORE_PASSWORD")
             keyAlias = "reminder"
-            keyPassword = "aireminder"
+            keyPassword = System.getenv("KEYSTORE_PASSWORD")
         }
     }
 
     buildTypes {
-        debug { signingConfig = signingConfigs.getByName("app") }
         release {
             isMinifyEnabled = false
             signingConfig = signingConfigs.getByName("app")

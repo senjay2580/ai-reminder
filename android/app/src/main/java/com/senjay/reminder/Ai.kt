@@ -93,13 +93,20 @@ object Ai {
 {"reply":"给用户的一句话中文确认","actions":[...]}
 
 action 只有三种：
-- 新建 {"op":"create","title":"简短标题","note":"补充说明，没有就空串","time":"HH:mm","date":"yyyy-MM-dd 或 null","days":[]}
-- 修改 {"op":"update","id":现有提醒的id,"title":..,"note":..,"time":..,"date":..,"days":..}（写修改后的完整字段）
+- 新建 {"op":"create","title":"简短标题","note":"补充说明，没有就空串","time":"HH:mm","date":"yyyy-MM-dd 或 null","days":[],"monthDay":null}
+- 修改 {"op":"update","id":现有提醒的id,"title":..,"note":..,"time":..,"date":..,"days":..,"monthDay":..}（写修改后的完整字段）
 - 删除 {"op":"delete","id":现有提醒的id}
 
-规则：
-- days 是重复的星期几，1=周一 … 7=周日；每天=[1,2,3,4,5,6,7]，工作日=[1,2,3,4,5]。重复提醒 date 填 null。
-- 不重复的提醒 days=[]、date 必填。只说了时间没说日期：今天这个时间还没过就用今天，已过就用明天。
+新建还是修改：
+- 默认一律新建。哪怕现有提醒里有同名、同类的，也新建一条，不要动原来的。
+- 只有用户明确说了「改」「换成」「推迟」「提前」「挪到」这类意思才用修改；明确说「删」「取消」「不要了」才用删除。
+
+重复方式（四选一）：
+- 只响一次：days=[]、monthDay=null、date 必填。只说了时间没说日期：今天这个时间还没过就用今天，已过就用明天。
+- 每天：days=[1,2,3,4,5,6,7]；工作日：days=[1,2,3,4,5]；每周几：days 填星期几，1=周一 … 7=周日。date=null、monthDay=null。
+- 每月几号：monthDay 填 1-31，days=[]、date=null。
+
+其他规则：
 - 「半小时后」「20分钟后」这类相对时间，从现在时间算出具体的 date 和 time。
 - 早上/上午用原数字；下午/晚上的 1-11 点加 12；中午12点=12:00；晚上12点=次日 00:00。
 - 修改、删除只能用现有提醒里的 id。找不到对应的提醒就不要输出这个 action，在 reply 里说清楚。
@@ -135,17 +142,21 @@ action 只有三种：
     }
 
     private fun taskFrom(a: JSONObject, id: Int, old: Task?, now: LocalDateTime): Task {
-        val days = a.optJSONArray("days")?.let { d -> (0 until d.length()).map(d::getInt).toSet() } ?: emptySet()
+        val monthDay = if (a.isNull("monthDay")) null else a.getInt("monthDay")
+        require(monthDay == null || monthDay in 1..31) { "每月几号不对：$monthDay" }
+        val days = if (monthDay != null) emptySet() else a.optJSONArray("days")?.let { d -> (0 until d.length()).map(d::getInt).toSet() } ?: emptySet()
         require(days.all { it in 1..7 }) { "星期几不对：$days" }
+        val once = monthDay == null && days.isEmpty()
         val t = Task(
             id = id,
             title = (a.optStringOrNull("title") ?: error("缺标题")).trim(),
             note = a.optStringOrNull("note")?.trim() ?: "",
             time = LocalTime.parse(a.getString("time").trim(), HM),
-            date = if (days.isEmpty()) LocalDate.parse(a.optStringOrNull("date") ?: error("只响一次的提醒缺日期")) else null,
+            date = if (once) LocalDate.parse(a.optStringOrNull("date") ?: error("只响一次的提醒缺日期")) else null,
             days = days,
             enabled = true,
             sound = old?.sound,
+            monthDay = monthDay,
         )
         if (t.next(now) == null) error("${t.summary()} 时间已经过了")
         return t

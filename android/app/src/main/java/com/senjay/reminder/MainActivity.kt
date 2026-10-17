@@ -25,6 +25,8 @@ import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.foundation.background
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.isSystemInDarkTheme
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
@@ -37,9 +39,14 @@ import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.imePadding
 import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.shape.CircleShape
+import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
@@ -79,17 +86,21 @@ import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.text.input.VisualTransformation
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.core.content.ContextCompat
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import java.time.LocalDate
 import java.time.LocalDateTime
+import java.time.LocalTime
 
 class MainActivity : ComponentActivity() {
     private val resumes = mutableIntStateOf(0)
@@ -132,9 +143,8 @@ fun App(resumes: Int) {
     var update by remember { mutableStateOf<Updater.Release?>(null) }
 
     LaunchedEffect(Unit) {
-        if (Prefs.get(ctx, Prefs.GH_TOKEN).isBlank()) return@LaunchedEffect
         try {
-            Updater.latest(ctx).takeIf { Updater.isNewer(it.version, BuildConfig.VERSION_NAME) }?.let { update = it }
+            Updater.latest().takeIf { Updater.isNewer(it.version, BuildConfig.VERSION_NAME) }?.let { update = it }
         } catch (e: CancellationException) {
             throw e
         } catch (e: Exception) {
@@ -142,7 +152,12 @@ fun App(resumes: Int) {
         }
     }
 
-    val commit: (List<Task>) -> Unit = { Store.put(ctx, it); tasks = it }
+    val commit: (List<Task>) -> Unit = { new ->
+        val old = tasks.map { it.id }.toSet()
+        Store.put(ctx, new)
+        tasks = new
+        new.filter { it.id !in old }.takeIf { it.isNotEmpty() }?.let { Notices.created(ctx, it) }
+    }
     if (settings) {
         BackHandler { settings = false }
         SettingsScreen(onBack = { settings = false }, onUpdate = { update = it })
@@ -156,7 +171,14 @@ fun App(resumes: Int) {
 fun MainScreen(tasks: List<Task>, resumes: Int, commit: (List<Task>) -> Unit, onSettings: () -> Unit) {
     val ctx = LocalContext.current
     var editing by remember { mutableStateOf<Task?>(null) }
-    val now = remember(tasks, resumes) { LocalDateTime.now() }
+    var detailId by remember { mutableStateOf<Int?>(null) }
+    var now by remember { mutableStateOf(LocalDateTime.now()) }
+    LaunchedEffect(tasks, resumes) {
+        while (true) { // 列表里的「还有多久」跟着走
+            now = LocalDateTime.now()
+            delay(30_000)
+        }
+    }
     val ai = remember { AiState() }
     val voice = remember { VoiceState() }
     val scope = rememberCoroutineScope()
@@ -208,7 +230,7 @@ fun MainScreen(tasks: List<Task>, resumes: Int, commit: (List<Task>) -> Unit, on
                 }
             }
             items(tasks.sortedWith(compareBy({ !it.enabled }, { it.next(now) ?: LocalDateTime.MAX })), key = { it.id }) { t ->
-                TaskRow(t, now, onClick = { editing = t }) { on ->
+                TaskRow(t, now, onClick = { detailId = t.id }) { on ->
                     commit(tasks.map { if (it.id == t.id) it.copy(enabled = on) else it })
                 }
             }
@@ -236,6 +258,76 @@ fun MainScreen(tasks: List<Task>, resumes: Int, commit: (List<Task>) -> Unit, on
             }),
         )
     }
+    tasks.find { it.id == detailId }?.let { t ->
+        TaskDetail(
+            t, now,
+            onDismiss = { detailId = null },
+            onEdit = {
+                detailId = null
+                editing = t
+            },
+            onDelete = {
+                commit(tasks.filter { it.id != t.id })
+                detailId = null
+            },
+        )
+    }
+}
+
+/** 一条提醒的全部信息:规则、接下来几次、还有多久、铃声。 */
+@Composable
+fun TaskDetail(t: Task, now: LocalDateTime, onDismiss: () -> Unit, onEdit: () -> Unit, onDelete: () -> Unit) {
+    val ctx = LocalContext.current
+    val next = t.upcoming(now, 3)
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text(t.title) },
+        text = {
+            Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                KindBadge(t)
+                DetailLine("规则", "${t.repeatText()} ${t.time.format(HHMM)}")
+                DetailLine(
+                    "下次",
+                    when {
+                        !t.enabled -> "已关闭"
+                        next.isEmpty() -> "已过期，不会再响"
+                        else -> "${whenText(next[0], now)}（${untilText(next[0], now)}）"
+                    },
+                )
+                if (t.enabled && next.size > 1) DetailLine("之后", next.drop(1).joinToString("\n") { whenText(it, now) })
+                if (t.note.isNotBlank()) DetailLine("备注", t.note)
+                DetailLine("铃声", t.sound?.let { soundName(ctx, it) } ?: "跟随默认铃声")
+            }
+        },
+        confirmButton = { TextButton(onEdit) { Text("编辑") } },
+        dismissButton = {
+            Row {
+                TextButton(onDelete) { Text("删除", color = MaterialTheme.colorScheme.error) }
+                TextButton(onDismiss) { Text("关闭") }
+            }
+        },
+    )
+}
+
+@Composable
+private fun DetailLine(label: String, value: String) {
+    Row {
+        Text(label, Modifier.width(48.dp), color = MaterialTheme.colorScheme.onSurfaceVariant)
+        Text(value)
+    }
+}
+
+/** 一眼区分:一次 / 每天 / 每周 / 每月。 */
+@Composable
+fun KindBadge(t: Task) {
+    Text(
+        t.kind,
+        Modifier
+            .background(MaterialTheme.colorScheme.secondaryContainer, RoundedCornerShape(4.dp))
+            .padding(horizontal = 6.dp, vertical = 2.dp),
+        color = MaterialTheme.colorScheme.onSecondaryContainer,
+        style = MaterialTheme.typography.labelSmall,
+    )
 }
 
 /** 每次重组都重新查:用户从系统设置页回来时 onResume 会触发重组。 */
@@ -333,7 +425,8 @@ fun InputBar(voice: VoiceState, busy: Boolean, onSend: (String) -> Unit) {
 
 @Composable
 fun TaskRow(t: Task, now: LocalDateTime, onClick: () -> Unit, onToggle: (Boolean) -> Unit) {
-    val expired = t.enabled && t.next(now) == null
+    val next = t.next(now)
+    val expired = t.enabled && next == null
     val dim = !t.enabled || expired
     Card(onClick, Modifier.fillMaxWidth()) {
         Row(Modifier.padding(16.dp), verticalAlignment = Alignment.CenterVertically) {
@@ -342,9 +435,20 @@ fun TaskRow(t: Task, now: LocalDateTime, onClick: () -> Unit, onToggle: (Boolean
                     t.time.format(HHMM), fontSize = 34.sp, fontWeight = FontWeight.Light,
                     color = if (dim) MaterialTheme.colorScheme.onSurfaceVariant else MaterialTheme.colorScheme.onSurface,
                 )
-                Text(t.title, style = MaterialTheme.typography.titleMedium)
+                Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                    KindBadge(t)
+                    Text(t.title, style = MaterialTheme.typography.titleMedium)
+                }
                 Text(
-                    listOfNotNull(t.repeatText(), "已过期".takeIf { expired }, t.note.ifBlank { null }).joinToString(" · "),
+                    listOfNotNull(
+                        t.repeatText(),
+                        when {
+                            !t.enabled -> null
+                            next == null -> "已过期"
+                            else -> "下次 ${whenText(next, now)} · ${untilText(next, now)}"
+                        },
+                        t.note.ifBlank { null },
+                    ).joinToString(" · "),
                     style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                 )
@@ -358,32 +462,73 @@ fun TaskRow(t: Task, now: LocalDateTime, onClick: () -> Unit, onToggle: (Boolean
 fun TaskDialog(initial: Task, onDismiss: () -> Unit, onSave: (Task) -> Unit, onDelete: (() -> Unit)?) {
     val ctx = LocalContext.current
     var t by remember { mutableStateOf(initial) }
+    var monthDayText by remember { mutableStateOf((initial.monthDay ?: LocalDate.now().dayOfMonth).toString()) }
+    var pickedDate by remember { mutableStateOf(initial.id != 0) } // 手动挑过日期就不再自动顺延
     AlertDialog(
         onDismissRequest = onDismiss,
-        title = { Text(if (initial.id == 0) "新建提醒" else "编辑提醒") },
         text = {
-            Column(Modifier.verticalScroll(rememberScrollState()), verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                OutlinedTextField(t.title, { t = t.copy(title = it) }, label = { Text("标题") }, singleLine = true)
-                OutlinedTextField(t.note, { t = t.copy(note = it) }, label = { Text("备注") })
-                OutlinedButton({
-                    TimePickerDialog(ctx, { _, h, m -> t = t.copy(time = t.time.withHour(h).withMinute(m)) }, t.time.hour, t.time.minute, true).show()
-                }) { Text("时间  ${t.time.format(HHMM)}") }
-                Text("重复（都不选 = 只响一次）", style = MaterialTheme.typography.labelMedium)
-                FlowRow(horizontalArrangement = Arrangement.spacedBy(4.dp)) {
+            Column(Modifier.verticalScroll(rememberScrollState()), verticalArrangement = Arrangement.spacedBy(12.dp)) {
+                // 和系统闹钟一样:大号时间点一下就改
+                Text(
+                    t.time.format(HHMM),
+                    Modifier.align(Alignment.CenterHorizontally).clickable {
+                        TimePickerDialog(ctx, { _, h, m ->
+                            val nt = LocalTime.of(h, m)
+                            val today = LocalDate.now()
+                            // 只响一次、没手动挑日期:今天这个点已过就顺延到明天
+                            val date = if (t.once && !pickedDate) (if (today.atTime(nt).isAfter(LocalDateTime.now())) today else today.plusDays(1)) else t.date
+                            t = t.copy(time = nt, date = date)
+                        }, t.time.hour, t.time.minute, true).show()
+                    },
+                    fontSize = 56.sp,
+                    fontWeight = FontWeight.Light,
+                )
+                // 一周七天随便勾:一个不勾 = 只响一次,全勾 = 每天
+                Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
                     (1..7).forEach { d ->
-                        FilterChip(
-                            selected = d in t.days,
-                            onClick = { t = t.copy(days = if (d in t.days) t.days - d else t.days + d) },
-                            label = { Text(weekdayName(d).takeLast(1)) },
-                        )
+                        DayCircle(weekdayName(d).takeLast(1), selected = t.monthDay == null && d in t.days) {
+                            t = t.copy(monthDay = null, days = if (d in t.days) t.days - d else t.days + d)
+                        }
                     }
                 }
-                if (t.days.isEmpty()) {
-                    val d = t.date ?: LocalDate.now()
-                    OutlinedButton({
-                        DatePickerDialog(ctx, { _, y, mo, day -> t = t.copy(date = LocalDate.of(y, mo + 1, day)) }, d.year, d.monthValue - 1, d.dayOfMonth).show()
-                    }) { Text("日期  $d") }
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Text(
+                        if (t.once) "只响一次" else t.repeatText(),
+                        Modifier.weight(1f),
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                    FilterChip(
+                        selected = t.monthDay != null,
+                        onClick = {
+                            t = if (t.monthDay != null) t.copy(monthDay = null)
+                            else t.copy(monthDay = monthDayText.toIntOrNull() ?: LocalDate.now().dayOfMonth, days = emptySet())
+                        },
+                        label = { Text("每月") },
+                    )
                 }
+                if (t.monthDay != null) {
+                    OutlinedTextField(
+                        monthDayText,
+                        { s ->
+                            monthDayText = s.filter(Char::isDigit).take(2)
+                            monthDayText.toIntOrNull()?.takeIf { it in 1..31 }?.let { t = t.copy(monthDay = it) }
+                        },
+                        Modifier.fillMaxWidth(),
+                        label = { Text("每月几号（小月没有这天就在月末响）") },
+                        singleLine = true,
+                        keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
+                    )
+                } else if (t.once) {
+                    val d = t.date ?: LocalDate.now()
+                    TextButton({
+                        DatePickerDialog(ctx, { _, y, mo, day ->
+                            t = t.copy(date = LocalDate.of(y, mo + 1, day))
+                            pickedDate = true
+                        }, d.year, d.monthValue - 1, d.dayOfMonth).show()
+                    }) { Text("日期：${d.monthValue}月${d.dayOfMonth}日 ${weekdayName(d.dayOfWeek.value)}  ›") }
+                }
+                OutlinedTextField(t.title, { t = t.copy(title = it) }, Modifier.fillMaxWidth(), label = { Text("提醒什么") }, singleLine = true)
+                OutlinedTextField(t.note, { t = t.copy(note = it) }, Modifier.fillMaxWidth(), label = { Text("备注（可不填）") })
                 SoundPicker(t.sound, "跟随默认铃声") { t = t.copy(sound = it) }
             }
         },
@@ -392,7 +537,7 @@ fun TaskDialog(initial: Task, onDismiss: () -> Unit, onSave: (Task) -> Unit, onD
                 val fixed = t.copy(
                     title = t.title.trim(),
                     enabled = true,
-                    date = if (t.days.isEmpty()) t.date ?: LocalDate.now() else null,
+                    date = if (t.once) t.date ?: LocalDate.now() else null,
                 )
                 when {
                     fixed.title.isEmpty() -> toast(ctx, "填个标题")
@@ -408,6 +553,17 @@ fun TaskDialog(initial: Task, onDismiss: () -> Unit, onSave: (Task) -> Unit, onD
             }
         },
     )
+}
+
+@Composable
+private fun DayCircle(label: String, selected: Boolean, onClick: () -> Unit) {
+    val c = MaterialTheme.colorScheme
+    Box(
+        Modifier.size(34.dp).clip(CircleShape).background(if (selected) c.primary else c.surfaceVariant).clickable(onClick = onClick),
+        contentAlignment = Alignment.Center,
+    ) {
+        Text(label, color = if (selected) c.onPrimary else c.onSurfaceVariant, style = MaterialTheme.typography.labelLarge)
+    }
 }
 
 /** sound = null 表示用上一级的默认(提醒→设置里的默认铃声→系统闹钟铃声)。 */
@@ -491,14 +647,13 @@ fun SettingsScreen(onBack: () -> Unit, onUpdate: (Updater.Release) -> Unit) {
             )
 
             Text("更新", style = MaterialTheme.typography.titleSmall)
-            PrefField(Prefs.GH_TOKEN, "GitHub Token（只读本仓库）", secret = true)
             Row(verticalAlignment = Alignment.CenterVertically) {
                 Text("当前版本 ${BuildConfig.VERSION_NAME}", Modifier.weight(1f))
                 Button(enabled = !checking, onClick = {
                     checking = true
                     scope.launch {
                         try {
-                            val r = Updater.latest(ctx)
+                            val r = Updater.latest()
                             if (Updater.isNewer(r.version, BuildConfig.VERSION_NAME)) onUpdate(r) else toast(ctx, "已经是最新版")
                         } catch (e: CancellationException) {
                             throw e

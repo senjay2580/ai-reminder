@@ -20,6 +20,7 @@ import android.os.VibrationEffect
 import android.os.Vibrator
 import android.provider.Settings
 import android.util.Log
+import androidx.compose.runtime.mutableStateListOf
 import java.time.LocalTime
 
 /**
@@ -33,20 +34,28 @@ class AlarmService : Service() {
     override fun onBind(intent: Intent?): IBinder? = null
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
-        val id = intent?.getIntExtra("id", -1) ?: -1
         when (intent?.action) {
             ACTION_SNOOZE -> {
-                Alarms.at(this, id, System.currentTimeMillis() + SNOOZE_MS, snooze = true)
+                val at = System.currentTimeMillis() + SNOOZE_MS
+                ringing.forEach {
+                    Alarms.at(this, it.id, at, snooze = true)
+                    if (it.id != Alarms.TEST_ID) Notices.upcoming(this, it, at)
+                }
                 stopSelf()
             }
             ACTION_STOP -> stopSelf()
             else -> {
+                val id = intent?.getIntExtra("id", -1) ?: -1
                 // ponytail: 接收器刚确认过任务存在,这里为空只可能是毫秒级的并发删除
                 val t = taskFor(this, id) ?: Task(id, "提醒", time = LocalTime.now())
-                startForeground(NOTIF_ID, notification(t))
+                ringing.removeAll { it.id == t.id }
+                ringing += t // 同一时间响的几个都留着,不互相顶掉
+                startForeground(NOTIF_ID, notification())
                 ring(t)
                 // 有悬浮窗权限时,用着手机也直接全屏弹出,而不只是顶部横幅
-                if (Settings.canDrawOverlays(this)) startActivity(alarmIntent(this, t.id).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
+                if (Settings.canDrawOverlays(this)) {
+                    startActivity(Intent(this, AlarmActivity::class.java).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
+                }
                 handler.removeCallbacksAndMessages(null)
                 handler.postDelayed({ stopSelf() }, RING_MS)
             }
@@ -55,6 +64,7 @@ class AlarmService : Service() {
     }
 
     override fun onDestroy() {
+        ringing.clear() // 弹窗看到列表空了会自己关掉
         handler.removeCallbacksAndMessages(null)
         player?.release()
         player = null
@@ -91,7 +101,7 @@ class AlarmService : Service() {
         }
     }
 
-    private fun notification(t: Task): Notification {
+    private fun notification(): Notification {
         getSystemService(NotificationManager::class.java).createNotificationChannel(
             NotificationChannel(CHANNEL, "提醒响铃", NotificationManager.IMPORTANCE_HIGH).apply {
                 setSound(null, null) // 声音和震动由服务自己放,通知只负责弹出
@@ -100,24 +110,26 @@ class AlarmService : Service() {
             }
         )
         val full = PendingIntent.getActivity(
-            this, t.id, alarmIntent(this, t.id), PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+            this, 0, Intent(this, AlarmActivity::class.java), PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
         )
+        val text = ringing.joinToString("\n") { listOf(it.time.format(HHMM), it.title, it.note).filter(String::isNotBlank).joinToString(" · ") }
         return Notification.Builder(this, CHANNEL)
             .setSmallIcon(R.drawable.ic_bell)
-            .setContentTitle(t.title)
-            .setContentText(listOf(t.time.format(HHMM), t.note).filter { it.isNotBlank() }.joinToString(" · "))
+            .setContentTitle(if (ringing.size == 1) ringing[0].title else "${ringing.size} 个提醒在响")
+            .setContentText(text)
+            .setStyle(Notification.BigTextStyle().bigText(text))
             .setCategory(Notification.CATEGORY_ALARM)
             .setVisibility(Notification.VISIBILITY_PUBLIC)
             .setFullScreenIntent(full, true)
             .setContentIntent(full)
             .setOngoing(true)
-            .addAction(action("稍后10分钟", ACTION_SNOOZE, t.id))
-            .addAction(action("关闭", ACTION_STOP, t.id))
+            .addAction(action("稍后10分钟", ACTION_SNOOZE))
+            .addAction(action("关闭", ACTION_STOP))
             .build()
     }
 
-    private fun action(label: String, act: String, id: Int): Notification.Action {
-        val intent = Intent(this, AlarmService::class.java).setAction(act).putExtra("id", id)
+    private fun action(label: String, act: String): Notification.Action {
+        val intent = Intent(this, AlarmService::class.java).setAction(act)
         val pi = PendingIntent.getService(this, act.hashCode(), intent, PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE)
         return Notification.Action.Builder(null as Icon?, label, pi).build()
     }
@@ -135,10 +147,11 @@ class AlarmService : Service() {
             .setContentType(AudioAttributes.CONTENT_TYPE_SONIFICATION)
             .build()
 
-        fun taskFor(ctx: Context, id: Int): Task? =
+        /** 正在响的提醒;服务和弹窗同进程,弹窗直接观察它。 */
+        val ringing = mutableStateListOf<Task>()
+
+        private fun taskFor(ctx: Context, id: Int): Task? =
             if (id == Alarms.TEST_ID) Task(id, "测试响铃", "能看到弹窗、听到铃声，说明权限都正常", LocalTime.now())
             else Store.load(ctx).find { it.id == id }
-
-        fun alarmIntent(ctx: Context, id: Int) = Intent(ctx, AlarmActivity::class.java).putExtra("id", id)
     }
 }

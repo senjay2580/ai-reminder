@@ -37,7 +37,6 @@ object Prefs {
     const val AI_BASE = "ai_base"
     const val AI_KEY = "ai_key"
     const val AI_MODELS = "ai_models"
-    const val GH_TOKEN = "gh_token"
     const val SOUND = "sound"
 
     private val DEFAULTS = mapOf(

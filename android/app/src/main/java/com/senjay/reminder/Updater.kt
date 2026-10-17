@@ -13,19 +13,18 @@ import java.io.IOException
 import java.net.HttpURLConnection
 import java.net.URL
 
-/** 查私有仓库最新 Release,下载 APK 交给系统安装器覆盖安装(同签名所以数据保留)。 */
+/** 查公开仓库最新 Release(免 token),下载 APK 交给系统安装器覆盖安装(同签名所以数据保留)。 */
 object Updater {
     private const val API = "https://api.github.com/repos/senjay2580/ai-reminder/releases/latest"
 
     data class Release(val version: String, val notes: String, val apkUrl: String)
 
-    suspend fun latest(ctx: Context): Release = withContext(Dispatchers.IO) {
-        val o = JSONObject(open(ctx, API, "application/vnd.github+json").inputStream.bufferedReader().use { it.readText() })
+    suspend fun latest(): Release = withContext(Dispatchers.IO) {
+        val o = JSONObject(open(API, "application/vnd.github+json").inputStream.bufferedReader().use { it.readText() })
         val assets = o.getJSONArray("assets")
         val apk = (0 until assets.length()).map(assets::getJSONObject).firstOrNull { it.getString("name").endsWith(".apk") }
             ?: throw IOException("最新 Release 里没有 APK")
-        // 私有仓库只能用资产的 API 地址下载,browser_download_url 会 404
-        Release(o.getString("tag_name").removePrefix("v"), o.optString("body"), apk.getString("url"))
+        Release(o.getString("tag_name").removePrefix("v"), o.optString("body"), apk.getString("browser_download_url"))
     }
 
     fun isNewer(remote: String, local: String): Boolean {
@@ -40,7 +39,7 @@ object Updater {
     }
 
     suspend fun download(ctx: Context, r: Release, onProgress: (Int) -> Unit): File = withContext(Dispatchers.IO) {
-        val c = open(ctx, r.apkUrl, "application/octet-stream")
+        val c = open(r.apkUrl, "application/octet-stream")
         val total = c.contentLengthLong
         val f = File(ctx.cacheDir, "update.apk")
         c.inputStream.use { input ->
@@ -79,26 +78,15 @@ object Updater {
         return true
     }
 
-    /** 资产地址会 302 到 S3 签名地址;S3 见到 token 会拒绝,所以手动跟随跳转、第二跳不带 token。 */
-    private fun open(ctx: Context, url: String, accept: String): HttpURLConnection {
-        val token = Prefs.get(ctx, Prefs.GH_TOKEN)
-        if (token.isBlank()) throw IOException("先在设置里填 GitHub Token")
-        var c = (URL(url).openConnection() as HttpURLConnection).apply {
-            instanceFollowRedirects = false
+    // 下载地址会 302 到 release-assets.githubusercontent.com,HttpURLConnection 默认会跟随
+    private fun open(url: String, accept: String): HttpURLConnection {
+        val c = (URL(url).openConnection() as HttpURLConnection).apply {
             connectTimeout = 15_000
             readTimeout = 30_000
             setRequestProperty("Accept", accept)
-            setRequestProperty("Authorization", "Bearer $token")
-        }
-        if (c.responseCode in 300..399) {
-            val loc = c.getHeaderField("Location") ?: throw IOException("跳转缺 Location")
-            c.disconnect()
-            c = (URL(loc).openConnection() as HttpURLConnection).apply {
-                connectTimeout = 15_000
-                readTimeout = 30_000
-            }
         }
         if (c.responseCode !in 200..299) {
+            // 未登录访问有每小时 60 次的限额,超了会回 403
             throw IOException("HTTP ${c.responseCode} ${c.errorStream?.bufferedReader()?.use { it.readText().take(200) }}")
         }
         return c

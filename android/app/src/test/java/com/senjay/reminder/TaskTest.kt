@@ -87,6 +87,44 @@ class TaskTest {
     }
 
     @Test
+    fun monthlyFallsBackToMonthEnd() {
+        val t = Task(1, "还款", time = LocalTime.of(9, 0), monthDay = 15)
+        assertEquals(LocalDateTime.of(2026, 11, 15, 9, 0), t.next(now)) // 本月 15 号已过
+        assertEquals(at(17, 16), t.copy(monthDay = 17, time = LocalTime.of(16, 0)).next(now)) // 今天还没到点
+        val end = t.copy(monthDay = 31)
+        assertEquals(
+            listOf(at(31, 9), LocalDateTime.of(2026, 11, 30, 9, 0), LocalDateTime.of(2026, 12, 31, 9, 0)), // 11 月没有 31 号 → 30 号
+            end.upcoming(now, 3),
+        )
+        assertEquals("每月", end.kind)
+        assertFalse(end.once) // 响过不能被当成一次性关掉
+        assertEquals(end, Task.fromJson(JSONObject(end.toJson().toString())))
+    }
+
+    @Test
+    fun parseMonthly() {
+        val content = """{"reply":"好","actions":[
+ {"op":"create","title":"还信用卡","note":"","time":"09:00","date":null,"days":[],"monthDay":15},
+ {"op":"create","title":"坏日子","note":"","time":"09:00","date":null,"days":[],"monthDay":40}
+]}"""
+        val r = Ai.parse(content, emptyList(), now)
+        val t = (r.actions.single() as Action.Create).task
+        assertEquals(15, t.monthDay)
+        assertTrue(t.days.isEmpty() && t.date == null)
+        assertTrue(r.reply.contains("忽略了一条"))
+    }
+
+    @Test
+    fun relativeTexts() {
+        assertEquals("今天 16:00", whenText(at(17, 16), now))
+        assertEquals("明天 08:00", whenText(at(18, 8), now))
+        assertEquals("10月20日 周二 20:00", whenText(at(20, 20), now))
+        assertEquals("40分钟后", untilText(at(17, 16), now))
+        assertEquals("16小时40分钟后", untilText(at(18, 8), now))
+        assertEquals("3天4小时后", untilText(at(20, 19, 20), now))
+    }
+
+    @Test
     fun versionCompare() {
         assertTrue(Updater.isNewer("1.0.10", "1.0.9"))
         assertFalse(Updater.isNewer("1.0.0", "1.0.0"))
