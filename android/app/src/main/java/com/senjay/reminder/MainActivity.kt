@@ -7,7 +7,6 @@ import android.app.AlarmManager
 import android.app.DatePickerDialog
 import android.app.NotificationManager
 import android.app.TimePickerDialog
-import android.content.ActivityNotFoundException
 import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
@@ -18,7 +17,6 @@ import android.os.Bundle
 import android.os.PowerManager
 import android.provider.OpenableColumns
 import android.provider.Settings
-import android.speech.RecognizerIntent
 import android.util.Log
 import android.widget.Toast
 import androidx.activity.ComponentActivity
@@ -29,12 +27,15 @@ import androidx.activity.enableEdgeToEdge
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.isSystemInDarkTheme
 import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.ExperimentalLayoutApi
 import androidx.compose.foundation.layout.FlowRow
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.imePadding
+import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
@@ -49,7 +50,6 @@ import androidx.compose.material3.Button
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.ExperimentalMaterial3Api
-import androidx.compose.material3.FilledTonalButton
 import androidx.compose.material3.FilterChip
 import androidx.compose.material3.FloatingActionButton
 import androidx.compose.material3.Icon
@@ -59,6 +59,7 @@ import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Scaffold
+import androidx.compose.material3.Surface
 import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
@@ -153,8 +154,32 @@ fun App(resumes: Int) {
 
 @Composable
 fun MainScreen(tasks: List<Task>, resumes: Int, commit: (List<Task>) -> Unit, onSettings: () -> Unit) {
+    val ctx = LocalContext.current
     var editing by remember { mutableStateOf<Task?>(null) }
     val now = remember(tasks, resumes) { LocalDateTime.now() }
+    val ai = remember { AiState() }
+    val voice = remember { VoiceState() }
+    val scope = rememberCoroutineScope()
+    val ask: (String) -> Unit = { q ->
+        if (q.isNotBlank() && !ai.busy) {
+            ai.asked = q.trim()
+            ai.busy = true
+            ai.error = null
+            ai.result = null
+            scope.launch {
+                try {
+                    ai.result = Ai.ask(ctx, ai.asked, tasks)
+                } catch (e: CancellationException) {
+                    throw e
+                } catch (e: Exception) {
+                    ai.error = e.message ?: e.toString()
+                } finally {
+                    ai.busy = false
+                }
+            }
+        }
+    }
+    Box {
     Scaffold(
         topBar = {
             TopAppBar(
@@ -162,6 +187,7 @@ fun MainScreen(tasks: List<Task>, resumes: Int, commit: (List<Task>) -> Unit, on
                 actions = { IconButton(onSettings) { Icon(Icons.Default.Settings, "设置") } },
             )
         },
+        bottomBar = { InputBar(voice, ai.busy, ask) },
         floatingActionButton = {
             FloatingActionButton({
                 val at = LocalDateTime.now().plusHours(1).withMinute(0).withSecond(0).withNano(0)
@@ -175,7 +201,12 @@ fun MainScreen(tasks: List<Task>, resumes: Int, commit: (List<Task>) -> Unit, on
             verticalArrangement = Arrangement.spacedBy(12.dp),
         ) {
             item { PermissionCard() }
-            item { AiBox(tasks, commit) }
+            if (ai.asked.isNotEmpty()) item {
+                AiCard(ai, onRetry = { ask(ai.asked) }) { actions ->
+                    commit(tasks.applyActions(actions))
+                    ai.clear()
+                }
+            }
             items(tasks.sortedWith(compareBy({ !it.enabled }, { it.next(now) ?: LocalDateTime.MAX })), key = { it.id }) { t ->
                 TaskRow(t, now, onClick = { editing = t }) { on ->
                     commit(tasks.map { if (it.id == t.id) it.copy(enabled = on) else it })
@@ -183,11 +214,13 @@ fun MainScreen(tasks: List<Task>, resumes: Int, commit: (List<Task>) -> Unit, on
             }
             if (tasks.isEmpty()) item {
                 Text(
-                    "还没有提醒。点右下角 + 手动添加，或在上面说一句话让 AI 建。",
+                    "还没有提醒。按住底部按钮说一句话让 AI 建，或点 + 手动添加。",
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                 )
             }
         }
+    }
+    if (voice.listening) VoiceOverlay(voice)
     }
     editing?.let { t ->
         TaskDialog(
@@ -237,80 +270,62 @@ fun PermissionCard() {
     }
 }
 
-@Composable
-fun AiBox(tasks: List<Task>, commit: (List<Task>) -> Unit) {
-    val ctx = LocalContext.current
-    val scope = rememberCoroutineScope()
-    var text by rememberSaveable { mutableStateOf("") }
-    var busy by remember { mutableStateOf(false) }
-    var result by remember { mutableStateOf<AiResult?>(null) }
-    var error by remember { mutableStateOf<String?>(null) }
+class AiState {
+    var asked by mutableStateOf("")
+    var busy by mutableStateOf(false)
+    var result by mutableStateOf<AiResult?>(null)
+    var error by mutableStateOf<String?>(null)
 
-    fun send(q: String) {
-        if (q.isBlank() || busy) return
-        busy = true
-        error = null
+    fun clear() {
+        asked = ""
         result = null
-        scope.launch {
-            try {
-                result = Ai.ask(ctx, q.trim(), tasks)
-            } catch (e: CancellationException) {
-                throw e
-            } catch (e: Exception) {
-                error = e.message ?: e.toString()
-            } finally {
-                busy = false
-            }
-        }
+        error = null
     }
+}
 
-    // 说完直接交给 AI,不用再点一次
-    val speech = rememberLauncherForActivityResult(ActivityResultContracts.StartActivityForResult()) { r ->
-        r.data?.getStringArrayListExtra(RecognizerIntent.EXTRA_RESULTS)?.firstOrNull()?.let {
-            text = it
-            send(it)
-        }
-    }
-
+/** 列表顶部:你说了什么 → AI 打算怎么改 → 确认才生效。 */
+@Composable
+fun AiCard(ai: AiState, onRetry: () -> Unit, onConfirm: (List<Action>) -> Unit) {
     Card(Modifier.fillMaxWidth()) {
         Column(Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
-            OutlinedTextField(
-                text, { text = it }, Modifier.fillMaxWidth(),
-                placeholder = { Text("说一句，比如：每个工作日早上7点半叫我起床") },
-                maxLines = 4,
-            )
-            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                FilledTonalButton(
-                    onClick = {
-                        try {
-                            speech.launch(
-                                Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH)
-                                    .putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_FREE_FORM)
-                                    .putExtra(RecognizerIntent.EXTRA_LANGUAGE, "zh-CN")
-                                    .putExtra(RecognizerIntent.EXTRA_PROMPT, "说出要提醒的事")
-                            )
-                        } catch (e: ActivityNotFoundException) {
-                            toast(ctx, "这台手机没有系统语音识别，用输入法的语音键说也一样")
-                        }
-                    },
-                    enabled = !busy,
-                    modifier = Modifier.weight(1f),
-                ) { Text("🎤 语音") }
-                Button({ send(text) }, Modifier.weight(1f), enabled = !busy && text.isNotBlank()) { Text("交给 AI") }
-            }
-            if (busy) LinearProgressIndicator(Modifier.fillMaxWidth())
-            error?.let { Text(it, color = MaterialTheme.colorScheme.error, style = MaterialTheme.typography.bodySmall) }
-            result?.let { r ->
+            Text("你说：${ai.asked}", style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
+            if (ai.busy) LinearProgressIndicator(Modifier.fillMaxWidth())
+            ai.error?.let { Text(it, color = MaterialTheme.colorScheme.error, style = MaterialTheme.typography.bodySmall) }
+            ai.result?.let { r ->
                 if (r.reply.isNotBlank()) Text(r.reply, style = MaterialTheme.typography.bodyMedium)
                 r.actions.forEach { Text("• " + it.describe(), fontWeight = FontWeight.Medium) }
-                Row(Modifier.align(Alignment.End)) {
-                    TextButton({ result = null }) { Text(if (r.actions.isEmpty()) "知道了" else "取消") }
-                    if (r.actions.isNotEmpty()) Button({
-                        commit(tasks.applyActions(r.actions))
-                        result = null
-                        text = ""
-                    }) { Text("确认") }
-                }
+            }
+            if (!ai.busy) Row(Modifier.align(Alignment.End)) {
+                val actions = ai.result?.actions.orEmpty()
+                TextButton(ai::clear) { Text(if (actions.isEmpty()) "关闭" else "取消") }
+                if (ai.error != null) Button(onRetry) { Text("重试") }
+                if (actions.isNotEmpty()) Button({ onConfirm(actions) }) { Text("确认") }
+            }
+        }
+    }
+}
+
+/** 仿微信底部输入栏:默认按住说话,左边切换打字。 */
+@Composable
+fun InputBar(voice: VoiceState, busy: Boolean, onSend: (String) -> Unit) {
+    var voiceMode by rememberSaveable { mutableStateOf(true) }
+    var text by rememberSaveable { mutableStateOf("") }
+    Surface(tonalElevation = 3.dp) {
+        Row(
+            Modifier.fillMaxWidth().navigationBarsPadding().imePadding().padding(8.dp),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(8.dp),
+        ) {
+            IconButton({ voiceMode = !voiceMode }) { Text(if (voiceMode) "⌨️" else "🎤", fontSize = 22.sp) }
+            if (voiceMode) {
+                HoldToTalk(voice, enabled = !busy, onText = onSend, modifier = Modifier.weight(1f))
+            } else {
+                OutlinedTextField(
+                    text, { text = it }, Modifier.weight(1f),
+                    placeholder = { Text("比如：工作日早上7点半叫我起床") },
+                    maxLines = 4,
+                )
+                Button({ onSend(text); text = "" }, enabled = !busy && text.isNotBlank()) { Text("发送") }
             }
         }
     }
