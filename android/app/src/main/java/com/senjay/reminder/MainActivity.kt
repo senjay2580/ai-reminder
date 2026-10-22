@@ -24,6 +24,7 @@ import androidx.activity.compose.BackHandler
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
+import androidx.activity.result.PickVisualMediaRequest
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
@@ -36,6 +37,7 @@ import androidx.compose.foundation.layout.FlowRow
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.imePadding
 import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.padding
@@ -50,7 +52,9 @@ import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
+import androidx.compose.material.icons.automirrored.filled.List
 import androidx.compose.material.icons.filled.Add
+import androidx.compose.material.icons.filled.DateRange
 import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
@@ -87,11 +91,14 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.text.input.VisualTransformation
+import androidx.compose.ui.text.style.TextAlign
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.core.content.ContextCompat
@@ -101,6 +108,7 @@ import kotlinx.coroutines.launch
 import java.time.LocalDate
 import java.time.LocalDateTime
 import java.time.LocalTime
+import java.time.YearMonth
 
 class MainActivity : ComponentActivity() {
     private val resumes = mutableIntStateOf(0)
@@ -179,18 +187,24 @@ fun MainScreen(tasks: List<Task>, resumes: Int, commit: (List<Task>) -> Unit, on
             delay(30_000)
         }
     }
+    var calendar by rememberSaveable { mutableStateOf(false) }
+    val today = now.toLocalDate()
+    var month by remember { mutableStateOf(YearMonth.now()) }
+    var day by remember { mutableStateOf(LocalDate.now()) }
     val ai = remember { AiState() }
     val voice = remember { VoiceState() }
     val scope = rememberCoroutineScope()
-    val ask: (String) -> Unit = { q ->
-        if (q.isNotBlank() && !ai.busy) {
+    val ask: (String, List<Uri>) -> Unit = { q, imgs ->
+        if ((q.isNotBlank() || imgs.isNotEmpty()) && !ai.busy) {
             ai.asked = q.trim()
+            ai.images = imgs
+            ai.picked = emptyList()
             ai.busy = true
             ai.error = null
             ai.result = null
             scope.launch {
                 try {
-                    ai.result = Ai.ask(ctx, ai.asked, tasks)
+                    ai.result = Ai.ask(ctx, ai.asked, ai.images, tasks)
                 } catch (e: CancellationException) {
                     throw e
                 } catch (e: Exception) {
@@ -206,14 +220,20 @@ fun MainScreen(tasks: List<Task>, resumes: Int, commit: (List<Task>) -> Unit, on
         topBar = {
             TopAppBar(
                 title = { Text("AI提醒") },
-                actions = { IconButton(onSettings) { Icon(Icons.Default.Settings, "设置") } },
+                actions = {
+                    IconButton({ calendar = !calendar }) {
+                        if (calendar) Icon(Icons.AutoMirrored.Filled.List, "列表") else Icon(Icons.Default.DateRange, "日历")
+                    }
+                    IconButton(onSettings) { Icon(Icons.Default.Settings, "设置") }
+                },
             )
         },
-        bottomBar = { InputBar(voice, ai.busy, ask) },
+        bottomBar = { InputBar(voice, ai) { ask(it, ai.picked) } },
         floatingActionButton = {
             FloatingActionButton({
                 val at = LocalDateTime.now().plusHours(1).withMinute(0).withSecond(0).withNano(0)
-                editing = Task(id = 0, title = "", time = at.toLocalTime(), date = at.toLocalDate())
+                // 日历里选中了以后的某天,就新建在那天
+                editing = Task(id = 0, title = "", time = at.toLocalTime(), date = if (calendar && day.isAfter(today)) day else at.toLocalDate())
             }) { Icon(Icons.Default.Add, "新建") }
         },
     ) { pad ->
@@ -223,22 +243,39 @@ fun MainScreen(tasks: List<Task>, resumes: Int, commit: (List<Task>) -> Unit, on
             verticalArrangement = Arrangement.spacedBy(12.dp),
         ) {
             item { PermissionCard() }
-            if (ai.asked.isNotEmpty()) item {
-                AiCard(ai, onRetry = { ask(ai.asked) }) { actions ->
+            if (ai.active) item {
+                AiCard(ai, onRetry = { ask(ai.asked, ai.images) }) { actions ->
                     commit(tasks.applyActions(actions))
                     ai.clear()
                 }
             }
-            items(tasks.sortedWith(compareBy({ !it.enabled }, { it.next(now) ?: LocalDateTime.MAX })), key = { it.id }) { t ->
-                TaskRow(t, now, onClick = { detailId = t.id }) { on ->
-                    commit(tasks.map { if (it.id == t.id) it.copy(enabled = on) else it })
+            if (calendar) {
+                item {
+                    MonthCalendar(tasks, month, day, today, onMonth = {
+                        month = it
+                        day = if (it == YearMonth.from(today)) today else it.atDay(1)
+                    }) { day = it }
                 }
-            }
-            if (tasks.isEmpty()) item {
-                Text(
-                    "还没有提醒。按住底部按钮说一句话让 AI 建，或点 + 手动添加。",
-                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                )
+                val list = tasks.on(day, today)
+                item {
+                    Text(
+                        "${day.monthValue}月${day.dayOfMonth}日 ${weekdayName(day.dayOfWeek.value)} · " + if (list.isEmpty()) "这天没有提醒" else "${list.size} 个提醒",
+                        style = MaterialTheme.typography.titleSmall,
+                    )
+                }
+                items(list, key = { "day${it.id}" }) { t -> DayRow(t, day.atTime(t.time), now) { detailId = t.id } }
+            } else {
+                items(tasks.sortedWith(compareBy({ !it.enabled }, { it.next(now) ?: LocalDateTime.MAX })), key = { it.id }) { t ->
+                    TaskRow(t, now, onClick = { detailId = t.id }) { on ->
+                        commit(tasks.map { if (it.id == t.id) it.copy(enabled = on) else it })
+                    }
+                }
+                if (tasks.isEmpty()) item {
+                    Text(
+                        "还没有提醒。按住底部按钮说一句话，或点 🖼️ 发课程表、通知截图让 AI 建；也可以点 + 手动添加。",
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                }
             }
         }
     }
@@ -247,6 +284,7 @@ fun MainScreen(tasks: List<Task>, resumes: Int, commit: (List<Task>) -> Unit, on
     editing?.let { t ->
         TaskDialog(
             t,
+            datePicked = t.id != 0 || calendar,
             onDismiss = { editing = null },
             onSave = { saved ->
                 commit(if (t.id == 0) tasks + saved.copy(id = nextId(tasks)) else tasks.map { if (it.id == saved.id) saved else it })
@@ -364,23 +402,32 @@ fun PermissionCard() {
 
 class AiState {
     var asked by mutableStateOf("")
+    var images by mutableStateOf<List<Uri>>(emptyList()) // 这次一起发出去的图,重试时再发一遍
+    var picked by mutableStateOf<List<Uri>>(emptyList()) // 选好了、还没发的图
     var busy by mutableStateOf(false)
     var result by mutableStateOf<AiResult?>(null)
     var error by mutableStateOf<String?>(null)
 
+    val active get() = asked.isNotEmpty() || images.isNotEmpty()
+
     fun clear() {
         asked = ""
+        images = emptyList()
         result = null
         error = null
     }
 }
 
-/** 列表顶部:你说了什么 → AI 打算怎么改 → 确认才生效。 */
+/** 列表顶部:你说了什么(发了几张图)→ AI 打算怎么改 → 确认才生效。 */
 @Composable
 fun AiCard(ai: AiState, onRetry: () -> Unit, onConfirm: (List<Action>) -> Unit) {
     Card(Modifier.fillMaxWidth()) {
         Column(Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
-            Text("你说：${ai.asked}", style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
+            Text(
+                listOfNotNull(ai.asked.ifBlank { null }?.let { "你说：$it" }, ai.images.size.takeIf { it > 0 }?.let { "🖼️ $it 张图" }).joinToString("  "),
+                style = MaterialTheme.typography.bodyMedium,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
             if (ai.busy) LinearProgressIndicator(Modifier.fillMaxWidth())
             ai.error?.let { Text(it, color = MaterialTheme.colorScheme.error, style = MaterialTheme.typography.bodySmall) }
             ai.result?.let { r ->
@@ -397,28 +444,106 @@ fun AiCard(ai: AiState, onRetry: () -> Unit, onConfirm: (List<Action>) -> Unit) 
     }
 }
 
-/** 仿微信底部输入栏:默认按住说话,左边切换打字。 */
+/** 仿微信底部输入栏:默认按住说话,左边切换打字、选图;选了图再说一句或打几个字一起发。 */
 @Composable
-fun InputBar(voice: VoiceState, busy: Boolean, onSend: (String) -> Unit) {
+fun InputBar(voice: VoiceState, ai: AiState, onSend: (String) -> Unit) {
     var voiceMode by rememberSaveable { mutableStateOf(true) }
     var text by rememberSaveable { mutableStateOf("") }
+    val pick = rememberLauncherForActivityResult(ActivityResultContracts.PickMultipleVisualMedia(3)) { if (it.isNotEmpty()) ai.picked = it }
     Surface(tonalElevation = 3.dp) {
-        Row(
-            Modifier.fillMaxWidth().navigationBarsPadding().imePadding().padding(8.dp),
-            verticalAlignment = Alignment.CenterVertically,
-            horizontalArrangement = Arrangement.spacedBy(8.dp),
-        ) {
-            IconButton({ voiceMode = !voiceMode }) { Text(if (voiceMode) "⌨️" else "🎤", fontSize = 22.sp) }
-            if (voiceMode) {
-                HoldToTalk(voice, enabled = !busy, onText = onSend, modifier = Modifier.weight(1f))
-            } else {
-                OutlinedTextField(
-                    text, { text = it }, Modifier.weight(1f),
-                    placeholder = { Text("比如：工作日早上7点半叫我起床") },
-                    maxLines = 4,
+        Column(Modifier.fillMaxWidth().navigationBarsPadding().imePadding().padding(8.dp)) {
+            if (ai.picked.isNotEmpty()) Row(verticalAlignment = Alignment.CenterVertically) {
+                Text(
+                    "🖼️ 已选 ${ai.picked.size} 张图，可以再说一句或打字补充",
+                    Modifier.weight(1f),
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
                 )
-                Button({ onSend(text); text = "" }, enabled = !busy && text.isNotBlank()) { Text("发送") }
+                TextButton({ ai.picked = emptyList() }) { Text("移除") }
+                Button({ onSend(text); text = "" }, enabled = !ai.busy) { Text("识别") }
             }
+            Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(4.dp)) {
+                IconButton({ voiceMode = !voiceMode }) { Text(if (voiceMode) "⌨️" else "🎤", fontSize = 22.sp) }
+                IconButton({ pick.launch(PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageOnly)) }, enabled = !ai.busy) {
+                    Text("🖼️", fontSize = 22.sp)
+                }
+                if (voiceMode) {
+                    HoldToTalk(voice, enabled = !ai.busy, onText = onSend, modifier = Modifier.weight(1f))
+                } else {
+                    OutlinedTextField(
+                        text, { text = it }, Modifier.weight(1f),
+                        placeholder = { Text(if (ai.picked.isEmpty()) "比如：工作日早上7点半叫我起床" else "比如：只要考试那几条，提前半小时") },
+                        maxLines = 4,
+                    )
+                    Button({ onSend(text); text = "" }, enabled = !ai.busy && (text.isNotBlank() || ai.picked.isNotEmpty())) { Text("发送") }
+                }
+            }
+        }
+    }
+}
+
+/** 月历:每天下面的点 = 那天会响几个(最多画 3 个);点哪天,下面就列哪天。 */
+@Composable
+fun MonthCalendar(tasks: List<Task>, month: YearMonth, selected: LocalDate, today: LocalDate, onMonth: (YearMonth) -> Unit, onPick: (LocalDate) -> Unit) {
+    val c = MaterialTheme.colorScheme
+    Card(Modifier.fillMaxWidth()) {
+        Column(Modifier.padding(8.dp)) {
+            Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+                TextButton({ onMonth(month.minusMonths(1)) }) { Text("‹", fontSize = 22.sp) }
+                Text("${month.year}年${month.monthValue}月", Modifier.weight(1f), textAlign = TextAlign.Center, style = MaterialTheme.typography.titleMedium)
+                TextButton({ onMonth(month.plusMonths(1)) }) { Text("›", fontSize = 22.sp) }
+            }
+            Row {
+                "一二三四五六日".forEach {
+                    Text(it.toString(), Modifier.weight(1f), textAlign = TextAlign.Center, style = MaterialTheme.typography.labelSmall, color = c.onSurfaceVariant)
+                }
+            }
+            val cells = List<LocalDate?>(month.atDay(1).dayOfWeek.value - 1) { null } + (1..month.lengthOfMonth()).map(month::atDay)
+            cells.chunked(7).forEach { week ->
+                Row {
+                    (0 until 7).forEach { i ->
+                        val d = week.getOrNull(i)
+                        Box(
+                            Modifier.weight(1f).height(52.dp).padding(2.dp).clip(RoundedCornerShape(8.dp))
+                                .background(if (d == selected) c.primaryContainer else Color.Transparent)
+                                .then(if (d == null) Modifier else Modifier.clickable { onPick(d) }),
+                            contentAlignment = Alignment.Center,
+                        ) {
+                            if (d != null) Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                                Text(
+                                    "${d.dayOfMonth}",
+                                    fontWeight = if (d == today) FontWeight.Bold else FontWeight.Normal,
+                                    color = if (d == today) c.primary else c.onSurface,
+                                )
+                                Text("•".repeat(minOf(tasks.on(d, today).size, 3)), color = c.primary, style = MaterialTheme.typography.labelSmall)
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+/** 日历下面的一行:这天几点响什么;已过或已关的变灰。 */
+@Composable
+fun DayRow(t: Task, at: LocalDateTime, now: LocalDateTime, onClick: () -> Unit) {
+    val color = if (!t.enabled || !at.isAfter(now)) MaterialTheme.colorScheme.onSurfaceVariant else MaterialTheme.colorScheme.onSurface
+    Card(onClick, Modifier.fillMaxWidth()) {
+        Row(
+            Modifier.padding(horizontal = 16.dp, vertical = 12.dp),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(10.dp),
+        ) {
+            Text(t.time.format(HHMM), fontSize = 22.sp, fontWeight = FontWeight.Light, color = color)
+            KindBadge(t)
+            Text(
+                t.title + if (t.note.isBlank()) "" else " · ${t.note}",
+                Modifier.weight(1f),
+                color = color,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+            )
         }
     }
 }
@@ -459,11 +584,11 @@ fun TaskRow(t: Task, now: LocalDateTime, onClick: () -> Unit, onToggle: (Boolean
 }
 
 @Composable
-fun TaskDialog(initial: Task, onDismiss: () -> Unit, onSave: (Task) -> Unit, onDelete: (() -> Unit)?) {
+fun TaskDialog(initial: Task, datePicked: Boolean, onDismiss: () -> Unit, onSave: (Task) -> Unit, onDelete: (() -> Unit)?) {
     val ctx = LocalContext.current
     var t by remember { mutableStateOf(initial) }
     var monthDayText by remember { mutableStateOf((initial.monthDay ?: LocalDate.now().dayOfMonth).toString()) }
-    var pickedDate by remember { mutableStateOf(initial.id != 0) } // 手动挑过日期就不再自动顺延
+    var pickedDate by remember { mutableStateOf(datePicked) } // 手动挑过日期(或在日历里点了那天)就不再自动顺延
     AlertDialog(
         onDismissRequest = onDismiss,
         text = {
@@ -627,8 +752,8 @@ fun SettingsScreen(onBack: () -> Unit, onUpdate: (Updater.Release) -> Unit) {
             verticalArrangement = Arrangement.spacedBy(12.dp),
         ) {
             Text("AI", style = MaterialTheme.typography.titleSmall)
-            PrefField(Prefs.AI_BASE, "接口地址（OpenAI 兼容，写到 /v1）")
-            PrefField(Prefs.AI_KEY, "API Key", secret = true)
+            PrefField(Prefs.AI_BASE, "接口地址（Responses 接口，写到 /v1）")
+            PrefField(Prefs.AI_KEY, "AI 令牌", secret = true)
             PrefField(Prefs.AI_MODELS, "模型（逗号分隔，前一个失败自动换下一个）")
 
             Text("提醒", style = MaterialTheme.typography.titleSmall)

@@ -48,6 +48,13 @@ data class Task(
             .firstOrNull { it.isAfter(now) && it.dayOfWeek.value in days }
     }
 
+    /** 这一天按规则会不会响(不看开关、不看是否已过);小月没有的号落在月末,和 next() 一致。 */
+    fun firesOn(d: LocalDate): Boolean = when {
+        monthDay != null -> d.dayOfMonth == minOf(monthDay, d.lengthOfMonth())
+        days.isEmpty() -> d == date
+        else -> d.dayOfWeek.value in days
+    }
+
     /** 接下来 n 次响铃时间(详情页展示用)。 */
     fun upcoming(now: LocalDateTime, n: Int): List<LocalDateTime> = generateSequence(next(now)) { next(it) }.take(n).toList()
 
@@ -87,6 +94,10 @@ data class Task(
 }
 
 fun nextId(tasks: List<Task>) = (tasks.maxOfOrNull { it.id } ?: 0) + 1
+
+/** 日历上某天列哪些:一次性的总在它那天(响过、关掉的界面上变灰);重复的只列今天往后、开着的。 */
+fun List<Task>.on(d: LocalDate, today: LocalDate) =
+    filter { it.firesOn(d) && (it.once || it.enabled && !d.isBefore(today)) }.sortedBy { it.time }
 
 fun weekdayName(d: Int) = "星期" + WEEK[d - 1]
 

@@ -8,6 +8,7 @@ import org.junit.Assert.assertNull
 import org.junit.Assert.assertThrows
 import org.junit.Assert.assertTrue
 import org.junit.Test
+import java.io.IOException
 import java.time.LocalDate
 import java.time.LocalDateTime
 import java.time.LocalTime
@@ -122,6 +123,39 @@ class TaskTest {
         assertEquals("40分钟后", untilText(at(17, 16), now))
         assertEquals("16小时40分钟后", untilText(at(18, 8), now))
         assertEquals("3天4小时后", untilText(at(20, 19, 20), now))
+    }
+
+    @Test
+    fun calendarListsWhatRingsThatDay() {
+        val today = now.toLocalDate() // 10-17 周六;10-19、11-30 是周一,11-5 是周四
+        val exam = Task(1, "考试", time = LocalTime.of(9, 0), date = LocalDate.of(2026, 11, 5), enabled = false)
+        val math = Task(2, "高数", time = LocalTime.of(8, 0), days = setOf(1))
+        val rent = Task(3, "还款", time = LocalTime.of(10, 0), monthDay = 31)
+        val off = math.copy(id = 4, enabled = false)
+        val all = listOf(exam, rent, math, off)
+        fun ids(m: Int, d: Int) = all.on(LocalDate.of(2026, m, d), today).map { it.id }
+        assertEquals(listOf(2), ids(10, 19)) // 关掉的重复提醒不列
+        assertEquals(emptyList<Int>(), ids(10, 12)) // 过去的周一不倒推重复提醒
+        assertEquals(listOf(1), ids(11, 5)) // 一次性的关掉了(响过)也留在那天
+        assertEquals(listOf(2, 3), ids(11, 30)) // 11 月没有 31 号 → 30 号;同一天按时间排
+    }
+
+    @Test
+    fun responsesBodyCarriesImagesAndHighEffort() {
+        val b = Ai.body("gpt-6.1-sol", "sys", "看图", listOf("data:image/jpeg;base64,AAA", "data:image/jpeg;base64,BBB"))
+        assertEquals("sys", b.getString("instructions"))
+        assertEquals("high", b.getJSONObject("reasoning").getString("effort")) // agentrouter 只认 high
+        val content = b.getJSONArray("input").getJSONObject(0).getJSONArray("content")
+        assertEquals(listOf("input_text", "input_image", "input_image"), (0 until content.length()).map { content.getJSONObject(it).getString("type") })
+        assertEquals("data:image/jpeg;base64,BBB", content.getJSONObject(2).getString("image_url"))
+    }
+
+    @Test
+    fun responsesOutputSkipsReasoning() {
+        val resp = """{"output":[{"type":"reasoning","summary":[]},
+ {"type":"message","content":[{"type":"output_text","text":"{\"reply\":"},{"type":"output_text","text":"\"好\",\"actions\":[]}"}]}]}"""
+        assertEquals("""{"reply":"好","actions":[]}""", Ai.outputText(resp))
+        assertThrows(IOException::class.java) { Ai.outputText("""{"output":[{"type":"reasoning","summary":[]}]}""") }
     }
 
     @Test

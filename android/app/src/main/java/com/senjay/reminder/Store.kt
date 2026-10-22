@@ -40,8 +40,9 @@ object Prefs {
     const val SOUND = "sound"
 
     private val DEFAULTS = mapOf(
-        AI_BASE to "https://newapi.104.238.160.199.nip.io/v1",
-        AI_MODELS to "glm-5.2,deepseek-v4-flash",
+        // VPS 上的 arelay(agentrouter 多 key 网关):Caddy 只放行 /v1/responses,且要带专用令牌
+        AI_BASE to "https://arelay.104.238.160.199.nip.io/v1",
+        AI_MODELS to "gpt-6.1-sol,gpt-6-astra",
     )
 
     private fun sp(ctx: Context) = ctx.getSharedPreferences("prefs", Context.MODE_PRIVATE)
