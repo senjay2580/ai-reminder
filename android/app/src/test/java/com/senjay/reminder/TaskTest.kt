@@ -159,6 +159,15 @@ class TaskTest {
     }
 
     @Test
+    fun missedMeansExpectedTimeLongPast() {
+        val a = Task(1, "a", time = LocalTime.NOON, days = setOf(1))
+        val tasks = listOf(a, a.copy(id = 2), a.copy(id = 3, enabled = false), a.copy(id = 4))
+        val expected = mapOf(1 to 1_000L, 2 to 100_000L, 3 to 1_000L) // 4 没有记录:旧版本装上来、还没排过
+        // 1 过点将近 2 分钟没响;2 过点不到 1 分钟,可能正在响;3 已关掉
+        assertEquals(listOf(1), Alarms.missed(tasks, expected::get, 120_000L).map { it.id })
+    }
+
+    @Test
     fun versionCompare() {
         assertTrue(Updater.isNewer("1.0.10", "1.0.9"))
         assertFalse(Updater.isNewer("1.0.0", "1.0.0"))

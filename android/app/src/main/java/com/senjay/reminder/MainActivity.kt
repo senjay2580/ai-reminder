@@ -7,6 +7,7 @@ import android.app.AlarmManager
 import android.app.DatePickerDialog
 import android.app.NotificationManager
 import android.app.TimePickerDialog
+import android.content.ActivityNotFoundException
 import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
@@ -146,7 +147,13 @@ private fun packageUri(ctx: Context) = Uri.parse("package:${ctx.packageName}")
 fun App(resumes: Int) {
     val ctx = LocalContext.current
     var tasks by remember { mutableStateOf(Store.load(ctx)) }
-    LaunchedEffect(resumes) { tasks = Store.load(ctx) }
+    var missed by remember { mutableStateOf(emptyList<Task>()) }
+    LaunchedEffect(resumes) {
+        val all = Store.load(ctx)
+        Alarms.missed(all, Alarms.expected(ctx), System.currentTimeMillis()).takeIf { it.isNotEmpty() }?.let { missed = it }
+        all.forEach { Alarms.schedule(ctx, it) } // 清理后台 / 强行停止会连带取消系统闹钟,回到前台就全部重排
+        tasks = all
+    }
     var settings by rememberSaveable { mutableStateOf(false) }
     var update by remember { mutableStateOf<Updater.Release?>(null) }
 
@@ -170,13 +177,20 @@ fun App(resumes: Int) {
         BackHandler { settings = false }
         SettingsScreen(onBack = { settings = false }, onUpdate = { update = it })
     } else {
-        MainScreen(tasks, resumes, commit, onSettings = { settings = true })
+        MainScreen(tasks, resumes, commit, missed, onMissedSeen = { missed = emptyList() }, onSettings = { settings = true })
     }
     update?.let { UpdateDialog(it) { update = null } }
 }
 
 @Composable
-fun MainScreen(tasks: List<Task>, resumes: Int, commit: (List<Task>) -> Unit, onSettings: () -> Unit) {
+fun MainScreen(
+    tasks: List<Task>,
+    resumes: Int,
+    commit: (List<Task>) -> Unit,
+    missed: List<Task>,
+    onMissedSeen: () -> Unit,
+    onSettings: () -> Unit,
+) {
     val ctx = LocalContext.current
     var editing by remember { mutableStateOf<Task?>(null) }
     var detailId by remember { mutableStateOf<Int?>(null) }
@@ -243,6 +257,7 @@ fun MainScreen(tasks: List<Task>, resumes: Int, commit: (List<Task>) -> Unit, on
             verticalArrangement = Arrangement.spacedBy(12.dp),
         ) {
             item { PermissionCard() }
+            if (missed.isNotEmpty()) item { MissedCard(missed, onFix = onSettings, onDismiss = onMissedSeen) }
             if (ai.active) item {
                 AiCard(ai, onRetry = { ask(ai.asked, ai.images) }) { actions ->
                     commit(tasks.applyActions(actions))
@@ -398,6 +413,55 @@ fun PermissionCard() {
             }
         }
     }
+}
+
+/** 有提醒到点没响:几乎都是清理后台时被系统连带杀掉了。摆出来并给修法,不让它悄悄发生。 */
+@Composable
+fun MissedCard(missed: List<Task>, onFix: () -> Unit, onDismiss: () -> Unit) {
+    Card(colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.errorContainer)) {
+        Column(Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
+            Text("${missed.size} 个提醒到点没响", fontWeight = FontWeight.Medium)
+            Text(missed.joinToString("、") { "${it.time.format(HHMM)} ${it.title}" }, style = MaterialTheme.typography.bodySmall)
+            Text(
+                "多半是清理后台时被系统连带杀掉了。之后的提醒已经重新排好；要防止再发生，去设置里开「自启动」并在多任务里锁定本应用。",
+                style = MaterialTheme.typography.bodySmall,
+            )
+            Row(Modifier.align(Alignment.End)) {
+                TextButton(onDismiss) { Text("知道了") }
+                Button(onFix) { Text("去设置") }
+            }
+        }
+    }
+}
+
+// 各家「自启动」管理页:没有公开 API,只能按包名逐个试
+private val AUTOSTART = listOf(
+    "com.miui.securitycenter" to "com.miui.permcenter.autostart.AutoStartManagementActivity", // 小米 / 红米
+    "com.huawei.systemmanager" to "com.huawei.systemmanager.startupmgr.ui.StartupNormalAppListActivity", // 华为
+    "com.huawei.systemmanager" to "com.huawei.systemmanager.optimize.process.ProtectActivity",
+    "com.hihonor.systemmanager" to "com.hihonor.systemmanager.startupmgr.ui.StartupNormalAppListActivity", // 荣耀
+    "com.coloros.safecenter" to "com.coloros.safecenter.permission.startup.StartupAppListActivity", // OPPO / 一加
+    "com.coloros.safecenter" to "com.coloros.safecenter.startupapp.StartupAppListActivity",
+    "com.oplus.safecenter" to "com.oplus.safecenter.permission.startup.StartupAppListActivity",
+    "com.vivo.permissionmanager" to "com.vivo.permissionmanager.activity.BgStartUpManagerActivity", // vivo / iQOO
+    "com.iqoo.secure" to "com.iqoo.secure.ui.phoneoptimize.BgStartUpManager",
+    "com.meizu.safe" to "com.meizu.safe.permission.SmartBGActivity", // 魅族
+)
+
+/** 跳到本机的自启动管理页;都打不开就退到应用详情页,让用户自己找。 */
+fun openAutostart(ctx: Context) {
+    for ((pkg, cls) in AUTOSTART) {
+        try {
+            ctx.startActivity(Intent().setClassName(pkg, cls))
+            return
+        } catch (e: ActivityNotFoundException) {
+            // 不是这个牌子,试下一个
+        } catch (e: SecurityException) {
+            Log.w("Autostart", "$cls 不让第三方打开", e)
+        }
+    }
+    ctx.startActivity(Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS, packageUri(ctx)))
+    toast(ctx, "没找到自启动页，在这里找「自启动 / 后台运行 / 耗电管理」")
 }
 
 class AiState {
@@ -765,11 +829,23 @@ fun SettingsScreen(onBack: () -> Unit, onUpdate: (Updater.Release) -> Unit) {
                 Alarms.at(ctx, Alarms.TEST_ID, System.currentTimeMillis() + 5_000)
                 toast(ctx, "5 秒后响铃，可以先锁屏试试")
             }) { Text("测试响铃") }
+
+            Text("清理后台也要响", style = MaterialTheme.typography.titleSmall)
             Text(
-                "小米、华为、OPPO、vivo 等手机还要在系统设置里给本应用打开「自启动」「后台弹出界面」「锁屏显示」，否则可能不响或不弹。",
+                "小米、华为、OPPO、vivo 等手机「一键清理」会把本应用连同排好的闹钟一起杀掉。照这三步做一次：\n" +
+                    "1. 点「去开自启动」把本应用打开；找不到就在应用详情里找「自启动 / 后台运行 / 耗电管理 → 无限制」，顺手打开「后台弹出界面」「锁屏显示」\n" +
+                    "2. 多任务界面把「AI提醒」卡片下拉或长按 → 锁定，一键清理就不会杀它\n" +
+                    "3. 点「清后台测试」，马上去多任务一键清理再锁屏，1 分钟后响了才算真的好了",
                 style = MaterialTheme.typography.bodySmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
             )
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                OutlinedButton({ openAutostart(ctx) }) { Text("去开自启动") }
+                OutlinedButton({
+                    Alarms.at(ctx, Alarms.TEST_ID, System.currentTimeMillis() + 60_000)
+                    toast(ctx, "1 分钟后响：现在去多任务一键清理，再锁屏等着")
+                }) { Text("清后台测试") }
+            }
 
             Text("更新", style = MaterialTheme.typography.titleSmall)
             Row(verticalAlignment = Alignment.CenterVertically) {

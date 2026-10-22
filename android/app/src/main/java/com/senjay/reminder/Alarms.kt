@@ -26,15 +26,26 @@ object Alarms {
 
     private fun am(ctx: Context) = ctx.getSystemService(AlarmManager::class.java)
 
+    // 每个提醒「下一次该在几点响」:响了会改写成再下一次(或清掉),所以一直停在过去 = 闹钟被系统杀了
+    private fun expect(ctx: Context) = ctx.getSharedPreferences("expect", Context.MODE_PRIVATE)
+
+    fun expected(ctx: Context): (Int) -> Long? = expect(ctx).let { sp -> { id -> sp.getLong("$id", -1).takeIf { it >= 0 } } }
+
+    /** 到点超过 1 分钟还没响的提醒。清理后台、强行停止会连带取消本应用的全部系统闹钟,就是这种样子。 */
+    fun missed(tasks: List<Task>, expected: (Int) -> Long?, now: Long) =
+        tasks.filter { t -> t.enabled && expected(t.id)?.let { it < now - 60_000 } == true }
+
     fun schedule(ctx: Context, t: Task) {
         val next = t.next(LocalDateTime.now())?.takeIf { t.enabled }
         if (next == null) {
             am(ctx).cancel(pi(ctx, t.id))
             am(ctx).cancel(pi(ctx, t.id, PRE))
             Notices.cancelUpcoming(ctx, t.id)
+            expect(ctx).edit().remove("${t.id}").apply()
             return
         }
         val at = next.toMillis()
+        expect(ctx).edit().putLong("${t.id}", at).apply()
         at(ctx, t.id, at)
         val preAt = at - Notices.WINDOW_MS
         if (preAt <= System.currentTimeMillis()) {
@@ -54,6 +65,7 @@ object Alarms {
     fun cancel(ctx: Context, id: Int) {
         listOf(0, SNOOZE, PRE).forEach { am(ctx).cancel(pi(ctx, id, it)) }
         Notices.cancelUpcoming(ctx, id)
+        expect(ctx).edit().remove("$id").apply()
     }
 }
 
