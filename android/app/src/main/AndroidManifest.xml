@@ -9,6 +9,7 @@
     <uses-permission android:name="android.permission.USE_FULL_SCREEN_INTENT" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PLAYBACK" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE" />
     <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
     <uses-permission android:name="android.permission.VIBRATE" />
     <uses-permission android:name="android.permission.WAKE_LOCK" />
@@ -52,6 +53,16 @@
             android:name=".AlarmService"
             android:exported="false"
             android:foregroundServiceType="mediaPlayback" />
+
+        <!-- Cortex 联动:全天挂长轮询收推送。dataSync 在 Android 15 每天限 6 小时,不适合常驻,所以用 specialUse -->
+        <service
+            android:name=".CortexService"
+            android:exported="false"
+            android:foregroundServiceType="specialUse">
+            <property
+                android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
+                android:value="Keeps a long-poll connection to the user's own Cortex server so pushed alarms and notifications arrive in real time." />
+        </service>
 
         <receiver
             android:name=".AlarmReceiver"

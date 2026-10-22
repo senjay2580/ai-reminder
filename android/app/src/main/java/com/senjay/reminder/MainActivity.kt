@@ -153,8 +153,13 @@ fun App(resumes: Int) {
         Alarms.missed(all, Alarms.expected(ctx), System.currentTimeMillis()).takeIf { it.isNotEmpty() }?.let { missed = it }
         all.forEach { Alarms.schedule(ctx, it) } // 清理后台 / 强行停止会连带取消系统闹钟,回到前台就全部重排
         tasks = all
+        Cortex.start(ctx) // 实时通道被杀过的话,回到前台拉起来
     }
+    // 后台改了列表(Cortex 推来闹钟、一次性提醒响过被关掉),界面跟着重读,免得下一次保存把它覆盖掉
+    val rev = Store.rev.intValue
+    LaunchedEffect(rev) { tasks = Store.load(ctx) }
     var settings by rememberSaveable { mutableStateOf(false) }
+    LaunchedEffect(settings) { if (!settings) Cortex.start(ctx) } // 设置里改了 Cortex 地址 / 令牌,回到主页时按新的生效
     var update by remember { mutableStateOf<Updater.Release?>(null) }
 
     LaunchedEffect(Unit) {
@@ -847,6 +852,9 @@ fun SettingsScreen(onBack: () -> Unit, onUpdate: (Updater.Release) -> Unit) {
                 }) { Text("清后台测试") }
             }
 
+            Text("Cortex 联动", style = MaterialTheme.typography.titleSmall)
+            CortexSettings()
+
             Text("更新", style = MaterialTheme.typography.titleSmall)
             Row(verticalAlignment = Alignment.CenterVertically) {
                 Text("当前版本 ${BuildConfig.VERSION_NAME}", Modifier.weight(1f))
@@ -868,6 +876,59 @@ fun SettingsScreen(onBack: () -> Unit, onUpdate: (Updater.Release) -> Unit) {
             }
         }
     }
+}
+
+/** 收 Cortex 的推送 / 闹钟,并把本机提醒整表同步上去。 */
+@Composable
+fun CortexSettings() {
+    val ctx = LocalContext.current
+    val scope = rememberCoroutineScope()
+    val notif = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) {}
+    var on by remember { mutableStateOf(Cortex.on(ctx)) }
+    var syncing by remember { mutableStateOf(false) }
+    var status by remember { mutableStateOf(Cortex.status(ctx)) }
+    LaunchedEffect(Unit) {
+        while (true) {
+            status = Cortex.status(ctx)
+            delay(2_000)
+        }
+    }
+    Row(verticalAlignment = Alignment.CenterVertically) {
+        Text(
+            "实时收 Cortex 的推送和闹钟（闹钟会加进本机提醒），并把本机提醒同步给 Cortex",
+            Modifier.weight(1f),
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
+        Switch(on, { v ->
+            on = v
+            Prefs.set(ctx, Prefs.CORTEX_ON, if (v) "1" else "")
+            if (v && Build.VERSION.SDK_INT >= 33 &&
+                ContextCompat.checkSelfPermission(ctx, Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED
+            ) notif.launch(Manifest.permission.POST_NOTIFICATIONS)
+            Cortex.start(ctx)
+        })
+    }
+    PrefField(Prefs.CORTEX_BASE, "服务器地址")
+    PrefField(Prefs.CORTEX_TOKEN, "设备令牌（Cortex 自动化 → 推送 里复制）", secret = true)
+    Text(status, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+    OutlinedButton(enabled = !syncing, onClick = {
+        syncing = true
+        scope.launch {
+            try {
+                Cortex.syncNow(ctx)
+                Cortex.start(ctx)
+                toast(ctx, "同步完成")
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                toast(ctx, "同步失败：${e.message}")
+            } finally {
+                syncing = false
+                status = Cortex.status(ctx)
+            }
+        }
+    }) { Text(if (syncing) "同步中…" else "立即同步") }
 }
 
 @Composable

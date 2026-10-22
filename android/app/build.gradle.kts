@@ -59,6 +59,7 @@ dependencies {
     implementation("androidx.activity:activity-compose:1.8.2")
     implementation("androidx.core:core-ktx:1.12.0")
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.7.3")
+    implementation("androidx.work:work-runtime:2.9.1") // Cortex 联动的 15 分钟兜底与改动后上传;2.10 起要 compileSdk 35
 
     testImplementation("junit:junit:4.13.2")
     testImplementation("org.json:json:20231013") // android.jar 里的 org.json 是桩,单测要真实现

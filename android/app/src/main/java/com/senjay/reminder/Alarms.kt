@@ -95,5 +95,6 @@ class BootReceiver : BroadcastReceiver() {
     override fun onReceive(ctx: Context, intent: Intent) {
         Log.i("BootReceiver", "${intent.action}:重排全部闹钟")
         Store.load(ctx).forEach { Alarms.schedule(ctx, it) }
+        Cortex.start(ctx) // 开机 / 更新后拉起 Cortex 实时通道(这几个广播里允许起前台服务)
     }
 }

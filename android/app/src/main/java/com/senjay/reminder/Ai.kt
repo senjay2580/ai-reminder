@@ -207,6 +207,7 @@ action 只有三种：
             enabled = true,
             sound = old?.sound,
             monthDay = monthDay,
+            push = old?.push,
         )
         if (t.next(now) == null) error("${t.summary()} 时间已经过了")
         return t

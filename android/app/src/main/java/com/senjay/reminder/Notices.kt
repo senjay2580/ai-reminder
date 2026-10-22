@@ -6,14 +6,17 @@ import android.app.NotificationManager
 import android.app.PendingIntent
 import android.content.Context
 import android.content.Intent
+import android.net.Uri
 
-/** 响铃之外的两类通知:提前 10 分钟的「即将提醒」(常驻、倒计时)和「已新建」。 */
+/** 响铃之外的通知:提前 10 分钟的「即将提醒」(常驻、倒计时)、「已新建」、Cortex 推送。 */
 object Notices {
     const val WINDOW_MS = 10 * 60_000L
     private const val CH_UPCOMING = "upcoming"
     private const val CH_CREATED = "created"
     private const val CREATED_ID = 2
     private const val UPCOMING_BASE = 100_000 // 每个提醒一条,id = 基数 + 提醒 id
+    private const val CH_CORTEX = "cortex"
+    private const val CORTEX_BASE = 200_000 // 每条推送一条,id = 基数 + 推送 id
 
     private fun nm(ctx: Context) = ctx.getSystemService(NotificationManager::class.java)
 
@@ -53,6 +56,27 @@ object Notices {
                 .setStyle(Notification.BigTextStyle().bigText(text))
                 .setAutoCancel(true)
                 .setContentIntent(open(ctx))
+                .build(),
+        )
+    }
+
+    /** Cortex 推来的通知(或错过的闹钟);点开跳 link,没有就打开本应用。 */
+    fun cortex(ctx: Context, pushId: Int, title: String, text: String, link: String?) {
+        nm(ctx).createNotificationChannel(NotificationChannel(CH_CORTEX, "Cortex 推送", NotificationManager.IMPORTANCE_DEFAULT))
+        val tap = if (link == null) open(ctx) else PendingIntent.getActivity(
+            ctx, CORTEX_BASE + pushId,
+            Intent(Intent.ACTION_VIEW, Uri.parse(link)).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK),
+            PendingIntent.FLAG_IMMUTABLE,
+        )
+        nm(ctx).notify(
+            CORTEX_BASE + pushId,
+            Notification.Builder(ctx, CH_CORTEX)
+                .setSmallIcon(R.drawable.ic_bell)
+                .setContentTitle(title.ifBlank { "Cortex" })
+                .setContentText(text)
+                .setStyle(Notification.BigTextStyle().bigText(text))
+                .setAutoCancel(true)
+                .setContentIntent(tap)
                 .build(),
         )
     }
