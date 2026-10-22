@@ -208,6 +208,7 @@ action 只有三种：
             sound = old?.sound,
             monthDay = monthDay,
             push = old?.push,
+            cid = old?.cid,
         )
         if (t.next(now) == null) error("${t.summary()} 时间已经过了")
         return t

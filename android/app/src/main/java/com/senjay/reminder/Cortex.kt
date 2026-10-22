@@ -31,19 +31,35 @@ import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import org.json.JSONArray
+import org.json.JSONException
 import org.json.JSONObject
 import java.io.IOException
 import java.net.HttpURLConnection
+import java.net.URI
 import java.net.URL
+import java.net.URLDecoder
 import java.time.Instant
 import java.time.LocalDateTime
+import java.time.LocalTime
 import java.time.ZoneId
 import java.util.concurrent.TimeUnit
 
 // ---------- 纯逻辑(单测覆盖) ----------
 
-/** Cortex 推来的一条:notify 立即通知;alarm 到 at(epoch 秒)响闹钟。 */
-data class Push(val id: Int, val kind: String, val title: String, val body: String, val at: Long?, val url: String, val acked: Boolean) {
+/**
+ * Cortex 推来的一条:notify 立即通知;alarm 到 at(epoch 秒)响闹钟;
+ * reminder_upsert / reminder_delete = 网页上改了手机里的提醒,data 是 JSON 字符串。
+ */
+data class Push(
+    val id: Int,
+    val kind: String,
+    val title: String,
+    val body: String,
+    val at: Long?,
+    val url: String,
+    val acked: Boolean,
+    val data: String = "",
+) {
     companion object {
         fun fromJson(o: JSONObject) = Push(
             id = o.getInt("id"),
@@ -53,31 +69,41 @@ data class Push(val id: Int, val kind: String, val title: String, val body: Stri
             at = if (o.isNull("at")) null else o.getDouble("at").toLong(), // 服务端给的是浮点秒
             url = o.optStringOrNull("url") ?: "",
             acked = !o.isNull("acked"),
+            data = o.optStringOrNull("data") ?: "",
         )
     }
 }
 
 sealed interface Plan {
-    /** 处理过(ack 没送到又被推回来),或已被确认过(重装后从 0 拉会拉回旧的):不再落地,只补 ack。 */
+    /** 处理过(ack 没送到又被推回来)、已被确认过(重装后从 0 拉会拉回旧的)、或不认识的类型:不落地,只 ack。 */
     data object Skip : Plan
     data object Notify : Plan
     /** at = 截到整分的 epoch 秒(提醒只存到分钟);ringNow = 已到点但晚得不多,马上响。 */
     data class Alarm(val at: Long, val ringNow: Boolean) : Plan
     /** 晚太多了:只发通知说错过了,不建提醒、不补响。 */
     data class Missed(val at: Long) : Plan
+    data object Upsert : Plan
+    data object Delete : Plan
 }
 
 const val LATE_OK_S = 10 * 60L
 
 fun plan(p: Push, done: Set<Int>, now: Long): Plan {
     if (p.id in done || p.acked) return Plan.Skip
-    if (p.kind != "alarm") return Plan.Notify // 不认识的类型也当通知弹出来,不吞
-    val at = p.at ?: now // 服务端保证 alarm 带 at;万一没有就当「现在」
-    val minute = at / 60 * 60
-    return when {
-        minute > now -> Plan.Alarm(minute, ringNow = false)
-        now - at <= LATE_OK_S -> Plan.Alarm(minute, ringNow = true)
-        else -> Plan.Missed(at)
+    return when (p.kind) {
+        "notify" -> Plan.Notify
+        "reminder_upsert" -> Plan.Upsert
+        "reminder_delete" -> Plan.Delete
+        "alarm" -> {
+            val at = p.at ?: now // 服务端保证 alarm 带 at;万一没有就当「现在」
+            val minute = at / 60 * 60
+            when {
+                minute > now -> Plan.Alarm(minute, ringNow = false)
+                now - at <= LATE_OK_S -> Plan.Alarm(minute, ringNow = true)
+                else -> Plan.Missed(at)
+            }
+        }
+        else -> Plan.Skip // 新版服务端加的类型,老 App 不认识:ack 掉,别卡住后面的
     }
 }
 
@@ -95,7 +121,7 @@ fun reminderPayload(tasks: List<Task>, now: LocalDateTime): JSONObject = JSONObj
     JSONArray(
         tasks.map { t ->
             JSONObject()
-                .put("id", t.id.toString())
+                .put("id", t.key)
                 .put("title", t.title)
                 .put("time", (t.next(now) ?: t.date?.atTime(t.time))?.let { it.toMillis() / 1000 } ?: JSONObject.NULL)
                 .put("repeat", t.repeatCode())
@@ -106,11 +132,76 @@ fun reminderPayload(tasks: List<Task>, now: LocalDateTime): JSONObject = JSONObj
     ),
 )
 
+/**
+ * reminder_upsert:按 id 找到就原地改(铃声、来源推送保留),找不到就按这个 id 新建
+ * (数字 id 且没被占用就直接用它当本机 id,否则记进 cid)。内容不对抛 IllegalArgumentException。
+ */
+fun List<Task>.upsert(d: JSONObject, zone: ZoneId = ZoneId.systemDefault()): List<Task> {
+    val key = d.optString("id").trim()
+    require(key.isNotEmpty()) { "缺 id" }
+    val title = d.optString("title").trim()
+    require(title.isNotEmpty()) { "缺标题" }
+    require(!d.isNull("time")) { "缺时间" }
+    val at = LocalDateTime.ofInstant(Instant.ofEpochSecond(d.getDouble("time").toLong()), zone) // 重复提醒只取时分
+    val rep = d.optString("repeat").trim().ifEmpty { "once" }
+    val old = find { it.key == key }
+    val id = old?.id ?: key.toIntOrNull()?.takeIf { n -> n > 0 && none { it.id == n } } ?: nextId(this)
+    val base = Task(
+        id = id,
+        title = title,
+        note = d.optStringOrNull("note") ?: "",
+        time = LocalTime.of(at.hour, at.minute),
+        enabled = d.optBoolean("enabled", true),
+        sound = old?.sound,
+        push = old?.push,
+        cid = if (id.toString() == key) null else key,
+    )
+    val t = when {
+        rep == "once" -> base.copy(date = at.toLocalDate())
+        rep == "daily" -> base.copy(days = (1..7).toSet())
+        rep.startsWith("weekly:") -> base.copy(
+            days = rep.removePrefix("weekly:").split(',').map { it.trim().toInt() }.toSet()
+                .also { ds -> require(ds.isNotEmpty() && ds.all { it in 1..7 }) { "星期不对：$rep" } },
+        )
+        rep.startsWith("monthly:") -> base.copy(
+            monthDay = rep.removePrefix("monthly:").trim().toInt().also { require(it in 1..31) { "每月几号不对：$rep" } },
+        )
+        else -> throw IllegalArgumentException("不认识的重复方式：$rep")
+    }
+    return if (old != null) map { if (it.id == old.id) t else it } else this + t
+}
+
+/** reminder_delete:按 id 删;本机已经没有了就什么都不变。 */
+fun List<Task>.removeKey(key: String): List<Task> = filter { it.key != key }
+
 /** 推送里的站内链接(/#/feed?…)补上服务器地址;空 = 点通知只打开本应用。 */
 fun pushLink(url: String, base: String): String? = when {
     url.isBlank() -> null
     url.startsWith("/") -> base.trimEnd('/') + url
     else -> url
+}
+
+/** Cortex 网页「在手机上一键连接」:aireminder://cortex?server=<编码过的地址>&token=<设备令牌> → (地址, 令牌)。 */
+fun parsePairLink(link: String): Pair<String, String> {
+    val u = URI.create(link) // 格式坏了抛 IllegalArgumentException
+    require(u.scheme == "aireminder" && u.host == "cortex") { "不是 Cortex 连接链接" }
+    val q = (u.rawQuery ?: "").split('&').filter { '=' in it }
+        .associate { it.substringBefore('=') to URLDecoder.decode(it.substringAfter('='), "UTF-8") }
+    val server = q["server"].orEmpty().trim().trimEnd('/')
+    val token = q["token"].orEmpty().trim()
+    require(server.startsWith("https://")) { "服务器地址必须是 https:// 开头" }
+    require(token.isNotEmpty()) { "缺设备令牌" }
+    return server to token
+}
+
+/** 服务端出错回 {"error": "…"}:把这句话给用户看;不是 JSON 就带上原文前 200 字。 */
+fun serverError(code: Int, body: String): String {
+    val msg = try {
+        JSONObject(body).optString("error")
+    } catch (e: JSONException) {
+        ""
+    }
+    return if (msg.isNotBlank()) "$msg（HTTP $code）" else "HTTP $code ${body.take(200)}"
 }
 
 /** 连续失败第 n 次后等多久:5 秒起翻倍,封顶 5 分钟。 */
@@ -123,17 +214,21 @@ fun rememberIds(done: List<Int>, ids: List<Int>): List<Int> = (done + ids).disti
 
 /**
  * 「Cortex 联动」:实时通道 = 前台服务挂长轮询(CortexService);兜底 = WorkManager 每 15 分钟拉一次 + 整表上传;
- * 提醒一改(Store.put)3 秒防抖后整表上传。失败只记下来显示在设置页,不弹、不崩。
+ * 提醒一改(Store.put)1 秒防抖后整表上传。失败只记下来显示在设置页,不弹、不崩。
  */
 object Cortex {
     private const val TAG = "Cortex"
     private const val PERIODIC = "cortex-sync"
     private const val UPLOAD = "cortex-upload"
 
+    private val bg = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+    private val uploadLock = Any()
+    private var pending: Job? = null
+
     private fun sp(ctx: Context) = ctx.getSharedPreferences("cortex", Context.MODE_PRIVATE)
-    private fun base(ctx: Context) = Prefs.get(ctx, Prefs.CORTEX_BASE).trimEnd('/')
     private val net get() = Constraints.Builder().setRequiredNetworkType(NetworkType.CONNECTED).build()
 
+    fun base(ctx: Context) = Prefs.get(ctx, Prefs.CORTEX_BASE).trimEnd('/')
     fun on(ctx: Context) = Prefs.get(ctx, Prefs.CORTEX_ON) == "1"
     fun ready(ctx: Context) = on(ctx) && base(ctx).isNotEmpty() && Prefs.get(ctx, Prefs.CORTEX_TOKEN).isNotEmpty()
 
@@ -156,17 +251,48 @@ object Cortex {
         }
     }
 
-    /** 提醒改了:3 秒内连续几次改动合成一次整表上传。 */
+    /** 一键连接 / 账号登录拿到了地址和令牌:存下来、打开联动、拉起通道。 */
+    fun connect(ctx: Context, server: String, token: String) {
+        Prefs.set(ctx, Prefs.CORTEX_BASE, server)
+        Prefs.set(ctx, Prefs.CORTEX_TOKEN, token)
+        Prefs.set(ctx, Prefs.CORTEX_ON, "1")
+        start(ctx)
+    }
+
+    /** 用 Cortex 账号换设备令牌:登录拿会话 cookie → 取令牌 → connect。密码只在这次请求里用,不存。 */
+    suspend fun login(ctx: Context, user: String, password: String) = withContext(Dispatchers.IO) {
+        val base = base(ctx)
+        if (!base.startsWith("https://")) throw IOException("服务器地址要以 https:// 开头，密码不能明文发")
+        val session = http("$base/api/login", JSONObject().put("user", user).put("password", password), emptyMap()).cookies
+            .map { it.substringBefore(';').trim() }
+            .firstOrNull { it.startsWith("s=") } ?: throw IOException("登录成功了，但服务器没给会话")
+        val token = http("$base/api/device", null, mapOf("Cookie" to session)).json.optString("token")
+        if (token.isBlank()) throw IOException("服务器没给设备令牌")
+        connect(ctx, base, token)
+    }
+
+    /** 提醒改了:1 秒内连续几次改动合成一次,马上整表上传;传不上交给 WorkManager 等有网再传。 */
     fun changed(ctx: Context) {
         if (!ready(ctx)) return
-        WorkManager.getInstance(ctx).enqueueUniqueWork(
-            UPLOAD, ExistingWorkPolicy.REPLACE,
-            OneTimeWorkRequestBuilder<CortexWorker>()
-                .setInitialDelay(3, TimeUnit.SECONDS)
-                .setConstraints(net)
-                .setInputData(workDataOf(CortexWorker.PULL to false))
-                .build(),
-        )
+        val app = ctx.applicationContext
+        synchronized(uploadLock) {
+            pending?.cancel()
+            pending = bg.launch {
+                delay(1_000)
+                try {
+                    upload(app)
+                    ok(app)
+                } catch (e: CancellationException) {
+                    throw e
+                } catch (e: Exception) {
+                    fail(app, e)
+                    WorkManager.getInstance(app).enqueueUniqueWork(
+                        UPLOAD, ExistingWorkPolicy.REPLACE,
+                        OneTimeWorkRequestBuilder<CortexWorker>().setConstraints(net).setInputData(workDataOf(CortexWorker.PULL to false)).build(),
+                    )
+                }
+            }
+        }
     }
 
     /** wait = 长轮询:有新推送立刻返回,没有就挂 ~50 秒。 */
@@ -181,17 +307,24 @@ object Cortex {
         call(ctx, "/api/device/reminders", reminderPayload(Store.load(ctx), LocalDateTime.now()))
     }
 
-    /** 逐条落地再 ack。服务和定时任务同进程、可能同时拉到同一条,所以判重 + 落地整段加锁。 */
+    /**
+     * 按 id 顺序逐条落地 → ack → 网页改过提醒的话马上整表上传(网页的「等手机确认」靠它清掉)。
+     * 服务和定时任务同进程、可能同时拉到同一条,所以判重 + 落地整段加锁。
+     */
     fun handle(ctx: Context, items: List<Push>) {
         if (items.isEmpty()) return
+        val sorted = items.sortedBy { it.id }
+        var edited = false
         synchronized(this) {
             val sp = sp(ctx)
             val old = sp.getString("done", "")!!.split(',').mapNotNull(String::toIntOrNull)
             val handled = mutableListOf<Int>()
             val now = System.currentTimeMillis() / 1000
             try {
-                for (p in items) {
-                    act(ctx, p, plan(p, (old + handled).toSet(), now), now)
+                for (p in sorted) {
+                    val pl = plan(p, (old + handled).toSet(), now)
+                    act(ctx, p, pl, now)
+                    if (pl == Plan.Upsert || pl == Plan.Delete) edited = true
                     handled += p.id // 落地一条记一条:中途出错,已落地的下次不会再来一遍
                 }
             } finally {
@@ -201,7 +334,11 @@ object Cortex {
                     .apply()
             }
         }
-        call(ctx, "/api/device/ack", JSONObject().put("ids", JSONArray(items.map { it.id })))
+        call(ctx, "/api/device/ack", JSONObject().put("ids", JSONArray(sorted.map { it.id })))
+        if (edited) {
+            synchronized(uploadLock) { pending?.cancel() } // 防抖那次不用再传了
+            upload(ctx)
+        }
     }
 
     private fun act(ctx: Context, p: Push, plan: Plan, now: Long) {
@@ -224,10 +361,29 @@ object Cortex {
                 if (plan.ringNow) Alarms.at(ctx, t.id, System.currentTimeMillis() + 1_000, snooze = true)
                 else Notices.created(ctx, listOf(t))
             }
+            Plan.Upsert, Plan.Delete -> try {
+                val d = JSONObject(p.data.ifBlank { "{}" })
+                val tasks = Store.load(ctx)
+                Store.put(
+                    ctx,
+                    if (plan == Plan.Upsert) tasks.upsert(d)
+                    else tasks.removeKey(d.optString("id").also { require(it.isNotBlank()) { "缺 id" } }),
+                )
+            } catch (e: IllegalArgumentException) {
+                badEdit(ctx, p, e)
+            } catch (e: JSONException) {
+                badEdit(ctx, p, e)
+            }
         }
     }
 
-    /** 设置页「立即同步」:拉一次 + 整表上传,失败抛给界面。 */
+    // 内容坏了重试也没用:弹通知说清楚,照常 ack,别卡住后面的推送
+    private fun badEdit(ctx: Context, p: Push, e: Exception) {
+        Log.w(TAG, "推送 #${p.id} ${p.kind} 内容不对:${p.data}", e)
+        Notices.cortex(ctx, p.id, "Cortex 改提醒没成功", "「${p.title}」：${e.message}", null)
+    }
+
+    /** 立即同步(设置页按钮、一键连接、回到前台):拉一次 + 整表上传,失败记下来再抛给调用方。 */
     suspend fun syncNow(ctx: Context) = withContext(Dispatchers.IO) {
         if (!ready(ctx)) throw IOException("先打开开关，填好服务器地址和设备令牌")
         try {
@@ -264,12 +420,17 @@ object Cortex {
 
     private fun local(s: Long) = LocalDateTime.ofInstant(Instant.ofEpochSecond(s), ZoneId.systemDefault())
 
-    private fun call(ctx: Context, path: String, body: JSONObject? = null, readMs: Int = 30_000): JSONObject {
-        val c = URL(base(ctx) + path).openConnection() as HttpURLConnection
+    private fun call(ctx: Context, path: String, body: JSONObject? = null, readMs: Int = 30_000): JSONObject =
+        http(base(ctx) + path, body, mapOf("Authorization" to "Bearer " + Prefs.get(ctx, Prefs.CORTEX_TOKEN)), readMs).json
+
+    private class Resp(val json: JSONObject, val cookies: List<String>)
+
+    private fun http(url: String, body: JSONObject?, headers: Map<String, String>, readMs: Int = 30_000): Resp {
+        val c = URL(url).openConnection() as HttpURLConnection
         try {
             c.connectTimeout = 15_000
             c.readTimeout = readMs
-            c.setRequestProperty("Authorization", "Bearer " + Prefs.get(ctx, Prefs.CORTEX_TOKEN))
+            for ((k, v) in headers) c.setRequestProperty(k, v)
             if (body != null) {
                 c.requestMethod = "POST"
                 c.doOutput = true
@@ -278,8 +439,9 @@ object Cortex {
             }
             val code = c.responseCode
             val text = (if (code in 200..299) c.inputStream else c.errorStream)?.bufferedReader()?.use { it.readText() } ?: ""
-            if (code !in 200..299) throw IOException("HTTP $code ${text.take(200)}")
-            return JSONObject(text)
+            if (code !in 200..299) throw IOException(serverError(code, text))
+            val cookies = c.headerFields.filterKeys { it?.equals("Set-Cookie", ignoreCase = true) == true }.values.flatten()
+            return Resp(JSONObject(text), cookies)
         } finally {
             c.disconnect()
         }
@@ -341,7 +503,7 @@ class CortexService : Service() {
         return Notification.Builder(this, CHANNEL)
             .setSmallIcon(R.drawable.ic_bell)
             .setContentTitle("Cortex 联动中")
-            .setContentText("Cortex 的推送和闹钟会实时送到")
+            .setContentText("Cortex 的推送、闹钟和提醒改动会实时送到")
             .setOngoing(true)
             .setContentIntent(PendingIntent.getActivity(this, 0, Intent(this, MainActivity::class.java), PendingIntent.FLAG_IMMUTABLE))
             .build()
@@ -354,7 +516,7 @@ class CortexService : Service() {
     }
 }
 
-/** 兜底:定时拉取 + 整表上传(PULL=true);或只上传(提醒改动后的防抖任务)。失败最多重试 2 次,原因记到设置页。 */
+/** 兜底:定时拉取 + 整表上传(PULL=true);或只上传(马上上传失败后等有网再传)。失败最多重试 2 次,原因记到设置页。 */
 class CortexWorker(ctx: Context, params: WorkerParameters) : CoroutineWorker(ctx, params) {
     override suspend fun doWork(): Result {
         val ctx = applicationContext

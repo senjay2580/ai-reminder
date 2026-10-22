@@ -28,8 +28,12 @@ data class Task(
     val sound: String? = null, // 铃声 uri;null = 用设置里的默认铃声
     val monthDay: Int? = null, // 每月几号;小月没有这天就在月末那天响
     val push: Int? = null, // 由 Cortex 推送建的:那条推送的 id(同步回去时标 from_push)
+    val cid: String? = null, // 在 Cortex 网页上建的:网页给的 id(cx…),之后网页改 / 删都按它找
 ) {
     val once get() = monthDay == null && days.isEmpty()
+
+    /** 和 Cortex 互认的 id:网页建的用网页的 id,本机建的用数字 id。 */
+    val key get() = cid ?: id.toString()
 
     val kind get() = when {
         monthDay != null -> "每月"
@@ -79,6 +83,7 @@ data class Task(
         .put("enabled", enabled)
         .put("sound", sound ?: JSONObject.NULL)
         .put("push", push ?: JSONObject.NULL)
+        .put("cid", cid ?: JSONObject.NULL)
 
     companion object {
         fun fromJson(o: JSONObject) = Task(
@@ -92,6 +97,7 @@ data class Task(
             sound = o.optStringOrNull("sound"),
             monthDay = if (o.isNull("monthDay")) null else o.getInt("monthDay"), // 旧数据没有这个键 → 不是每月
             push = if (o.isNull("push")) null else o.getInt("push"),
+            cid = o.optStringOrNull("cid"),
         )
     }
 }

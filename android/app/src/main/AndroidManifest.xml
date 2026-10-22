@@ -39,6 +39,13 @@
                 <action android:name="android.intent.action.MAIN" />
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
+            <!-- Cortex 网页「在手机上一键连接」:aireminder://cortex?server=…&token=… -->
+            <intent-filter>
+                <action android:name="android.intent.action.VIEW" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <category android:name="android.intent.category.BROWSABLE" />
+                <data android:scheme="aireminder" android:host="cortex" />
+            </intent-filter>
         </activity>
 
         <!-- 响铃弹窗:锁屏上方显示、点亮屏幕,独立任务栈不带出主界面 -->

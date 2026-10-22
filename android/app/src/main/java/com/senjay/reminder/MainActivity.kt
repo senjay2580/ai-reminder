@@ -83,6 +83,7 @@ import androidx.compose.material3.lightColorScheme
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.key
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -103,6 +104,7 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.core.content.ContextCompat
+import androidx.lifecycle.lifecycleScope
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
@@ -113,11 +115,45 @@ import java.time.YearMonth
 
 class MainActivity : ComponentActivity() {
     private val resumes = mutableIntStateOf(0)
+    private val pairing = mutableStateOf<Pair<String, String>?>(null) // 一键连接链接指向别的服务器:先问一句
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         enableEdgeToEdge()
-        setContent { AppTheme { App(resumes.intValue) } }
+        setContent {
+            AppTheme {
+                App(resumes.intValue)
+                pairing.value?.let { (server, token) ->
+                    PairDialog(server, onConnect = { pairing.value = null; pair(server, token) }, onCancel = { pairing.value = null })
+                }
+            }
+        }
+        if (savedInstanceState == null && intent.flags and Intent.FLAG_ACTIVITY_LAUNCHED_FROM_HISTORY == 0) openLink(intent)
+    }
+
+    override fun onNewIntent(intent: Intent) {
+        super.onNewIntent(intent)
+        openLink(intent)
+    }
+
+    /**
+     * Cortex 网页「在手机上一键连接」打开的 aireminder://cortex?server=…&token=…。
+     * 和当前设置的是同一台服务器就直接连;换到别的服务器要先确认——那边能推闹钟、能看到全部提醒。
+     */
+    private fun openLink(intent: Intent?) {
+        val link = intent?.takeIf { it.action == Intent.ACTION_VIEW }?.dataString ?: return
+        val (server, token) = try {
+            parsePairLink(link)
+        } catch (e: IllegalArgumentException) {
+            toast(this, "Cortex 连接链接不对：${e.message}")
+            return
+        }
+        if (server == Cortex.base(this)) pair(server, token) else pairing.value = server to token
+    }
+
+    private fun pair(server: String, token: String) {
+        Cortex.connect(this, server, token)
+        lifecycleScope.launch { syncAfterConnect(this@MainActivity) }
     }
 
     // 回到前台时界面重读:响过的一次性提醒已被接收器关掉,权限也可能刚在系统设置里改过
@@ -154,6 +190,13 @@ fun App(resumes: Int) {
         all.forEach { Alarms.schedule(ctx, it) } // 清理后台 / 强行停止会连带取消系统闹钟,回到前台就全部重排
         tasks = all
         Cortex.start(ctx) // 实时通道被杀过的话,回到前台拉起来
+        if (Cortex.ready(ctx)) try {
+            Cortex.syncNow(ctx) // 回到前台补拉一次 + 整表上传,不等长轮询 / 定时
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            Log.w("Cortex", "回到前台同步失败(已记到设置页状态)", e)
+        }
     }
     // 后台改了列表(Cortex 推来闹钟、一次性提醒响过被关掉),界面跟着重读,免得下一次保存把它覆盖掉
     val rev = Store.rev.intValue
@@ -878,7 +921,30 @@ fun SettingsScreen(onBack: () -> Unit, onUpdate: (Updater.Release) -> Unit) {
     }
 }
 
-/** 收 Cortex 的推送 / 闹钟,并把本机提醒整表同步上去。 */
+@Composable
+fun PairDialog(server: String, onConnect: () -> Unit, onCancel: () -> Unit) = AlertDialog(
+    onDismissRequest = onCancel,
+    title = { Text("连接这个 Cortex？") },
+    text = {
+        Text("链接要把本应用连到 $server，和现在设置的服务器不同。连上后它能给手机推闹钟和通知，也能看到、修改你的全部提醒。不认识这个地址就取消。")
+    },
+    confirmButton = { TextButton(onConnect) { Text("连接") } },
+    dismissButton = { TextButton(onCancel) { Text("取消") } },
+)
+
+/** 刚连上(一键连接 / 账号登录):马上同步一次,成败都告诉用户。 */
+suspend fun syncAfterConnect(ctx: Context) {
+    try {
+        Cortex.syncNow(ctx)
+        toast(ctx, "已连接 Cortex")
+    } catch (e: CancellationException) {
+        throw e
+    } catch (e: Exception) {
+        toast(ctx, "已连接 Cortex，但同步失败：${e.message}")
+    }
+}
+
+/** 收 Cortex 的推送 / 闹钟,并把本机提醒整表同步上去。连接方式:网页一键连接 / 账号登录 / 手动贴令牌。 */
 @Composable
 fun CortexSettings() {
     val ctx = LocalContext.current
@@ -887,9 +953,13 @@ fun CortexSettings() {
     var on by remember { mutableStateOf(Cortex.on(ctx)) }
     var syncing by remember { mutableStateOf(false) }
     var status by remember { mutableStateOf(Cortex.status(ctx)) }
+    var user by remember { mutableStateOf("") }
+    var password by remember { mutableStateOf("") } // 只在内存里,登录完就清,不存盘
+    var fields by remember { mutableIntStateOf(0) } // 登录换了令牌,让地址 / 令牌框重读
     LaunchedEffect(Unit) {
         while (true) {
             status = Cortex.status(ctx)
+            on = Cortex.on(ctx)
             delay(2_000)
         }
     }
@@ -909,8 +979,44 @@ fun CortexSettings() {
             Cortex.start(ctx)
         })
     }
-    PrefField(Prefs.CORTEX_BASE, "服务器地址")
-    PrefField(Prefs.CORTEX_TOKEN, "设备令牌（Cortex 自动化 → 推送 里复制）", secret = true)
+    Text(
+        "连接方式：在手机浏览器打开 Cortex 网页点「在手机上一键连接」；或在下面用 Cortex 账号连接；或手动贴设备令牌。",
+        style = MaterialTheme.typography.bodySmall,
+        color = MaterialTheme.colorScheme.onSurfaceVariant,
+    )
+    key(fields) {
+        PrefField(Prefs.CORTEX_BASE, "服务器地址")
+        PrefField(Prefs.CORTEX_TOKEN, "设备令牌（Cortex 自动化 → 推送 里复制）", secret = true)
+    }
+    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+        OutlinedTextField(user, { user = it }, Modifier.weight(1f), label = { Text("账号") }, singleLine = true)
+        OutlinedTextField(
+            password, { password = it }, Modifier.weight(1f),
+            label = { Text("密码") },
+            singleLine = true,
+            visualTransformation = PasswordVisualTransformation(),
+            keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Password),
+        )
+    }
+    OutlinedButton(enabled = !syncing && user.isNotBlank() && password.isNotEmpty(), onClick = {
+        syncing = true
+        scope.launch {
+            try {
+                Cortex.login(ctx, user.trim(), password)
+                password = ""
+                on = true
+                fields++
+                syncAfterConnect(ctx)
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                toast(ctx, "连接失败：${e.message}")
+            } finally {
+                syncing = false
+                status = Cortex.status(ctx)
+            }
+        }
+    }) { Text("用 Cortex 账号连接") }
     Text(status, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
     OutlinedButton(enabled = !syncing, onClick = {
         syncing = true
