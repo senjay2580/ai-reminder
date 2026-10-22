@@ -108,10 +108,12 @@ import androidx.lifecycle.lifecycleScope
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
+import java.time.Instant
 import java.time.LocalDate
 import java.time.LocalDateTime
 import java.time.LocalTime
 import java.time.YearMonth
+import java.time.ZoneId
 
 class MainActivity : ComponentActivity() {
     private val resumes = mutableIntStateOf(0)
@@ -249,6 +251,10 @@ fun MainScreen(
             delay(30_000)
         }
     }
+    // 后台检查记下的 Cortex 实时通道断开 + 是否已允许后台运行:回到前台(从系统设置页回来)和每 30 秒重读
+    val down = remember(resumes, now) {
+        Cortex.link(ctx).takeIf { it.broken && Cortex.ready(ctx) }?.let { it to Cortex.exempt(ctx) }
+    }
     var calendar by rememberSaveable { mutableStateOf(false) }
     val today = now.toLocalDate()
     var month by remember { mutableStateOf(YearMonth.now()) }
@@ -305,6 +311,7 @@ fun MainScreen(
             verticalArrangement = Arrangement.spacedBy(12.dp),
         ) {
             item { PermissionCard() }
+            if (down != null) item { CortexDownCard(down.first, exempt = down.second) }
             if (missed.isNotEmpty()) item { MissedCard(missed, onFix = onSettings, onDismiss = onMissedSeen) }
             if (ai.active) item {
                 AiCard(ai, onRetry = { ask(ai.asked, ai.images) }) { actions ->
@@ -479,6 +486,47 @@ fun MissedCard(missed: List<Task>, onFix: () -> Unit, onDismiss: () -> Unit) {
                 Button(onFix) { Text("去设置") }
             }
         }
+    }
+}
+
+/**
+ * Cortex 实时通道在后台被停掉、又自己恢复不了(兜底任务记下的 Link):推送只能等 15 分钟一次的兜底。
+ * 打开应用时通道会临时接上,所以不看「现在在不在跑」,只看后台检查的结果;后台检查到通道活着就自动消失。
+ */
+@Composable
+fun CortexDownCard(link: Link, exempt: Boolean) {
+    val ctx = LocalContext.current
+    Card(colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.errorContainer)) {
+        Column(Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
+            Text("Cortex 推送会晚到 15 分钟以上", fontWeight = FontWeight.Medium)
+            Text(
+                "${whenText(LocalDateTime.ofInstant(Instant.ofEpochMilli(link.since), ZoneId.systemDefault()), LocalDateTime.now())} 起，" +
+                    "Cortex 实时通道在后台被系统停掉，" +
+                    (if (link.why.isNotEmpty()) "没法自己重新接上：${link.why}。" else "重新接上后又被反复停掉。") +
+                    "现在推送和闹钟只能靠每 15 分钟一次的兜底收到，手机休眠时更晚。",
+                style = MaterialTheme.typography.bodySmall,
+            )
+            Text(
+                "照下面开好就行；之后后台检查到通道正常（15 分钟内），这张卡片会自己消失。",
+                style = MaterialTheme.typography.bodySmall,
+            )
+            FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                if (exempt) TextButton({}, enabled = false) { Text("已允许后台运行") }
+                else Button({ askIgnoreBattery(ctx) }) { Text("允许后台运行（关闭电池优化）") }
+                OutlinedButton({ openAutostart(ctx) }) { Text("去开自启动") }
+            }
+        }
+    }
+}
+
+/** 系统「允许在后台运行」弹框(忽略电池优化);个别 ROM 没有这个页面就退到应用详情,让用户自己找。 */
+fun askIgnoreBattery(ctx: Context) {
+    try {
+        ctx.startActivity(Intent(Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS, packageUri(ctx)))
+    } catch (e: ActivityNotFoundException) {
+        Log.w("Battery", "本机没有「忽略电池优化」弹框", e)
+        ctx.startActivity(Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS, packageUri(ctx)))
+        toast(ctx, "在这里找「电池 / 耗电管理 → 无限制 / 允许后台运行」")
     }
 }
 

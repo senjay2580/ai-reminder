@@ -91,10 +91,11 @@ class AlarmReceiver : BroadcastReceiver() {
     }
 }
 
+/** 开机、自身更新、改时间 / 时区;以及划掉任务后 Cortex.restartSoon 排的精确闹钟(Cortex.RESTART)。 */
 class BootReceiver : BroadcastReceiver() {
     override fun onReceive(ctx: Context, intent: Intent) {
         Log.i("BootReceiver", "${intent.action}:重排全部闹钟")
         Store.load(ctx).forEach { Alarms.schedule(ctx, it) }
-        Cortex.start(ctx) // 开机 / 更新后拉起 Cortex 实时通道(这几个广播里允许起前台服务)
+        Cortex.start(ctx) // 拉起 Cortex 实时通道(这几个广播和精确闹钟里都允许起前台服务)
     }
 }

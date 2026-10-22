@@ -35,6 +35,7 @@ git tag v1.2.0 && git push origin v1.2.0
 3. 手动贴设备令牌（Cortex 自动化 → 推送 里复制）。
 
 - **收推送**：前台服务 `CortexService`（类型 `specialUse`，常驻低优先级通知「Cortex 联动中」）循环挂 `GET /api/device/wait` 长轮询；出错按 5 秒起翻倍、封顶 5 分钟退避。兜底是 WorkManager 每 15 分钟 `GET /api/device/pull`。开机 / 更新 / 回到前台都会重新拉起。
+- **服务被杀后自愈**（v1.4.1）：兜底任务每次先看 `CortexService` 在不在，不在就从后台拉起。Android 12+ 后台起前台服务要豁免（最常见的是「允许后台运行」= 关电池优化），不许时不崩，记下原因、这次照旧拉取。检查结果存成 `Link`：拉不起来、或连续两次发现没在跑（拉起了又被停），首页亮「Cortex 推送会晚到 15 分钟以上」卡片，给「允许后台运行（关闭电池优化）」和「去开自启动」两个按钮；后台检查到通道在跑才消失（打开应用时通道会临时接上，所以不看当下在不在跑）。划掉最近任务时（`onTaskRemoved`）排一个 5 秒后的精确闹钟经 `BootReceiver` 再拉一次；系统按 `START_STICKY` 重启服务却不许上前台时记下原因并停掉，不让整个进程崩。
 - **alarm** → 本机新建一次性提醒（标记来源推送 id），走正常全屏响铃；收到时已过点 ≤10 分钟马上响，更晚只发「错过的闹钟」通知，不补响。**notify** → 「Cortex 推送」通知，点开跳 `url`（`/` 开头的补服务器地址）。处理完 `POST /api/device/ack`；按推送 id 判重（ack 没送到会被推回来），已被确认过的不再处理。
 - **网页 / Cortex 改手机提醒**（提醒只有一份 = App 里那份；Cortex 的到点提醒、Agent 设的提醒也走这条）：`reminder_upsert`（data = id/title/time/repeat/enabled/note，可带 `push`）先找目标——带 `push` 的找「由推送 #push 建的那条」，找不到再按 id（网页 `cx…` id 或本机数字 id）找——找到就原地改（身份、铃声不变），找不到就按这个 id 新建并通知「已新建提醒」；网页 id 存进提醒的 `cid` 字段，之后改 / 删都按它找。`reminder_delete` 同样按 push / id 找到就删，本机没有就不动。落地 → ack → 马上整表上传（网页的「等手机确认」靠它清掉）。内容不合法弹通知说明、照常 ack；不认识的推送类型直接 ack 忽略。
 - **传提醒**：任何改动（`Store.put`：新建 / 修改 / 删除 / 开关 / 一次性提醒响过）1 秒防抖后马上整表 `POST /api/device/reminders`，传不上交给 WorkManager 等有网重传；回到前台、每次定时任务也各传一次（全量替换；id = 网页 id 或本机数字 id；repeat = `once` / `daily` / `weekly:1,3,5` / `monthly:15`，星期 ISO 1=周一）。列表界面看 `Store.rev`，后台改了实时刷新。
@@ -54,4 +55,4 @@ git tag v1.2.0 && git push origin v1.2.0
 | `Voice.kt` | 仿微信按住说话（SpeechRecognizer；没有识别服务时退回系统语音弹窗） |
 | `Ai.kt` | 调 Responses 接口（agentrouter 的 gpt-6.x 只开这个，effort 只认 high）；图片按 EXIF 摆正、长边缩到 2048、白底 JPEG 发出；提示词写明一次 / 重复的判断信号；默认新建、明确说改/删才改删；输出逐条校验，不合格的写进回复不静默丢 |
 | `Updater.kt` | 查公开 Release、下载 APK、调起安装 |
-| `Cortex.kt` | Cortex 联动：推送处理决策（判重、晚到规则、重复格式映射、网页改 / 删提醒、一键连接链接解析，单测覆盖）、接口调用、账号登录换令牌、常驻长轮询服务、WorkManager 兜底 |
+| `Cortex.kt` | Cortex 联动：推送处理决策（判重、晚到规则、重复格式映射、网页改 / 删提醒、一键连接链接解析，单测覆盖）、接口调用、账号登录换令牌、常驻长轮询服务、WorkManager 兜底（顺带检查并拉起实时通道，断开判断 `Link` 单测覆盖） |

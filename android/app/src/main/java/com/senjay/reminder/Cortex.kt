@@ -1,5 +1,6 @@
 package com.senjay.reminder
 
+import android.app.AlarmManager
 import android.app.Notification
 import android.app.NotificationChannel
 import android.app.NotificationManager
@@ -8,6 +9,8 @@ import android.app.Service
 import android.content.Context
 import android.content.Intent
 import android.os.IBinder
+import android.os.PowerManager
+import android.os.SystemClock
 import android.util.Log
 import androidx.core.content.ContextCompat
 import androidx.work.Constraints
@@ -219,6 +222,19 @@ fun backoffMs(fails: Int): Long = minOf(5 * 60_000L, 5_000L shl (fails - 1).coer
 /** 处理过的推送 id 只留最近 200 个:够判重(ack 没送到的 24 小时内会被推回来),又不无限长。 */
 fun rememberIds(done: List<Int>, ids: List<Int>): List<Int> = (done + ids).distinct().takeLast(200)
 
+/**
+ * 兜底定时任务眼里的实时通道。since = 这一轮从何时(epoch 毫秒)起发现没在跑,0 = 正常;
+ * misses = 连续几次定时检查发现没在跑;why = 最近一次从后台拉不起来的原因。
+ */
+data class Link(val since: Long = 0, val misses: Int = 0, val why: String = "") {
+    /** 首页亮卡片:从后台拉不起来,或拉起来了却没撑到下一次检查(连续两次发现没在跑)。被杀一次、马上拉回来不打扰。 */
+    val broken get() = why.isNotEmpty() || misses >= 2
+
+    /** 定时检查一次:服务在跑就算恢复;没在跑就累计,err = 这次从后台拉起的报错(null = 拉起没报错)。 */
+    fun next(running: Boolean, err: String?, now: Long) =
+        if (running) Link() else Link(if (since > 0) since else now, misses + 1, err.orEmpty())
+}
+
 // ---------- 和 Cortex 通信 ----------
 
 /**
@@ -241,24 +257,70 @@ object Cortex {
     fun on(ctx: Context) = Prefs.get(ctx, Prefs.CORTEX_ON) == "1"
     fun ready(ctx: Context) = on(ctx) && base(ctx).isNotEmpty() && Prefs.get(ctx, Prefs.CORTEX_TOKEN).isNotEmpty()
 
-    /** 开着就拉起实时通道 + 15 分钟兜底(首次入队会立刻跑一次:拉取 + 整表上传);关了就都停。重复调用无害。 */
-    fun start(ctx: Context) {
+    /**
+     * 开着就拉起实时通道 + 15 分钟兜底(首次入队会立刻跑一次:拉取 + 整表上传);关了就都停。重复调用无害。
+     * 返回实时通道拉不起来的原因,null = 没问题。
+     */
+    fun start(ctx: Context): String? {
         val wm = WorkManager.getInstance(ctx)
         if (!ready(ctx)) {
             ctx.stopService(Intent(ctx, CortexService::class.java))
             wm.cancelUniqueWork(PERIODIC)
-            return
+            sp(ctx).edit().remove("down_since").remove("down_misses").remove("down_why").apply() // 关了联动,旧的断开记录作废
+            return null
         }
         wm.enqueueUniquePeriodicWork(
             PERIODIC, ExistingPeriodicWorkPolicy.KEEP,
             PeriodicWorkRequestBuilder<CortexWorker>(15, TimeUnit.MINUTES).setConstraints(net).build(),
         )
-        try {
+        return try {
             ContextCompat.startForegroundService(ctx, Intent(ctx, CortexService::class.java))
-        } catch (e: IllegalStateException) { // Android 12+ 不许后台起前台服务:记下来,等下次回到前台再起
+            null
+        } catch (e: IllegalStateException) { // Android 12+ 后台起前台服务要豁免(ForegroundServiceStartNotAllowedException):记下来
+            fail(ctx, e)
+            e.message ?: e.javaClass.simpleName
+        }
+    }
+
+    /**
+     * 兜底定时任务每次调:实时通道没在跑(进程被系统杀过、服务被停)就从后台拉起。Android 12+ 后台起前台服务
+     * 要豁免,最常见的是关了电池优化;不许就不崩,记下原因,这次照旧由定时任务拉取。结果存成 Link,首页据此亮卡片。
+     */
+    fun revive(ctx: Context) {
+        // ponytail: 只看服务在不在,不看长轮询是否卡住;请求都有超时,卡住会自己出来
+        val running = CortexService.running
+        val err = if (running) null else start(ctx)?.let { e ->
+            if (exempt(ctx)) "系统不许后台拉起（$e）" else "本应用没关电池优化，Android 12 起系统不许它在后台自己重连"
+        }
+        val l = link(ctx).next(running, err, System.currentTimeMillis())
+        Log.i(TAG, "兜底检查实时通道:${if (running) "在跑" else "没在跑,已尝试拉起"} → $l")
+        sp(ctx).edit().putLong("down_since", l.since).putInt("down_misses", l.misses).putString("down_why", l.why).apply()
+    }
+
+    fun link(ctx: Context) = sp(ctx).let { Link(it.getLong("down_since", 0), it.getInt("down_misses", 0), it.getString("down_why", "")!!) }
+
+    /** 是否已「允许后台运行」(不受电池优化):Android 12+ 有它才能从后台拉起实时通道。 */
+    fun exempt(ctx: Context) = ctx.getSystemService(PowerManager::class.java).isIgnoringBatteryOptimizations(ctx.packageName)
+
+    /**
+     * 几秒后用精确闹钟拉起实时通道:交给 BootReceiver 走 start。精确闹钟触发时系统允许起前台服务;
+     * 服务还活着的话再 start 一次是空操作。
+     */
+    fun restartSoon(ctx: Context) {
+        if (!ready(ctx)) return
+        val pi = PendingIntent.getBroadcast(
+            ctx, 0, Intent(ctx, BootReceiver::class.java).setAction(RESTART),
+            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE,
+        )
+        try {
+            ctx.getSystemService(AlarmManager::class.java)
+                .setExactAndAllowWhileIdle(AlarmManager.ELAPSED_REALTIME_WAKEUP, SystemClock.elapsedRealtime() + 5_000, pi)
+        } catch (e: SecurityException) { // 精确闹钟权限被收回(首页权限卡片会提示):只能等兜底任务
             fail(ctx, e)
         }
     }
+
+    const val RESTART = "com.senjay.reminder.CORTEX_RESTART"
 
     /** 一键连接 / 账号登录拿到了地址和令牌:存下来、打开联动、拉起通道。 */
     fun connect(ctx: Context, server: String, token: String) {
@@ -418,9 +480,11 @@ object Cortex {
         val now = LocalDateTime.now()
         val okAt = sp.getLong("ok_at", 0)
         val errAt = sp.getLong("err_at", 0)
+        val down = link(ctx)
         fun t(ms: Long) = whenText(local(ms / 1000), now) + ":%02d".format(local(ms / 1000).second)
         return listOfNotNull(
             "实时通道：" + if (CortexService.running) "在线" else "未运行",
+            if (down.broken) "后台检查：${t(down.since)} 起断开，" + down.why.ifEmpty { "拉起后又被系统停掉" } else null,
             "上次同步：" + if (okAt > 0) t(okAt) else "还没成功过",
             if (errAt > okAt) "上次出错（${t(errAt)}）：${sp.getString("err", "")}" else null,
         ).joinToString("\n")
@@ -467,7 +531,15 @@ class CortexService : Service() {
     override fun onBind(intent: Intent?): IBinder? = null
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
-        startForeground(NOTIF_ID, notification()) // 先上前台:startForegroundService 后不调就崩,哪怕马上要停
+        try {
+            startForeground(NOTIF_ID, notification()) // 先上前台:startForegroundService 后不调就崩,哪怕马上要停
+        } catch (e: IllegalStateException) {
+            // Android 12+:系统按 START_STICKY 重启本服务时也可能不许上前台。崩了会带走整个进程,
+            // 所以记下来、停掉,交给兜底任务 / 回到前台再拉起
+            Cortex.fail(this, e)
+            stopSelf()
+            return START_NOT_STICKY
+        }
         if (!Cortex.ready(this)) {
             stopSelf()
             return START_NOT_STICKY
@@ -475,6 +547,13 @@ class CortexService : Service() {
         running = true
         if (loop?.isActive != true) loop = scope.launch { poll() }
         return START_STICKY // 被系统杀了让它自己拉起来
+    }
+
+    // 划掉最近任务:原生系统里服务照常活着,不少国产 ROM 随后会把整个进程杀掉。先排好几秒后再拉起一次
+    override fun onTaskRemoved(rootIntent: Intent?) {
+        Log.i("Cortex", "任务被划掉,5 秒后再拉起实时通道")
+        Cortex.restartSoon(this)
+        super.onTaskRemoved(rootIntent)
     }
 
     override fun onDestroy() {
@@ -524,14 +603,20 @@ class CortexService : Service() {
     }
 }
 
-/** 兜底:定时拉取 + 整表上传(PULL=true);或只上传(马上上传失败后等有网再传)。失败最多重试 2 次,原因记到设置页。 */
+/**
+ * 兜底:定时拉取 + 整表上传(PULL=true),顺带检查实时通道、没在跑就拉起;或只上传(马上上传失败后等有网再传)。
+ * 失败最多重试 2 次,原因记到设置页。
+ */
 class CortexWorker(ctx: Context, params: WorkerParameters) : CoroutineWorker(ctx, params) {
     override suspend fun doWork(): Result {
         val ctx = applicationContext
         if (!Cortex.ready(ctx)) return Result.success()
+        val pull = inputData.getBoolean(PULL, true)
         return try {
             withContext(Dispatchers.IO) {
-                if (inputData.getBoolean(PULL, true)) Cortex.handle(ctx, Cortex.fetch(ctx, wait = false))
+                // 只在定时那次的首跑检查:重试几十秒后又来,会把一次断开记成「连续两次没在跑」
+                if (pull && runAttemptCount == 0) Cortex.revive(ctx)
+                if (pull) Cortex.handle(ctx, Cortex.fetch(ctx, wait = false))
                 Cortex.upload(ctx)
             }
             Cortex.ok(ctx)

@@ -111,6 +111,33 @@ class CortexTest {
     }
 
     @Test
+    fun linkCardOnlyWhenChannelCannotRecoverInBackground() {
+        val t0 = 1_792_677_000_000L
+        val q = 15 * 60_000L // 兜底任务间隔
+        assertFalse(Link().broken)
+
+        // 被杀一次、后台马上拉回来:不打扰;下次检查在跑就清零
+        val once = Link().next(running = false, err = null, now = t0)
+        assertEquals(Link(t0, 1, ""), once)
+        assertFalse(once.broken)
+        assertEquals(Link(), once.next(running = true, err = null, now = t0 + q))
+
+        // 拉起了却没撑到下一次检查:亮卡片,断开时间记第一次发现的
+        val twice = once.next(running = false, err = null, now = t0 + q)
+        assertTrue(twice.broken)
+        assertEquals(t0, twice.since)
+
+        // Android 12+ 没关电池优化、后台不许拉起:第一次就亮卡片,带上原因
+        val denied = Link().next(running = false, err = "没关电池优化", now = t0)
+        assertTrue(denied.broken)
+        assertEquals("没关电池优化", denied.why)
+        // 之后某次拉起没报错(刚关了电池优化),但连续第二次发现没在跑,卡片还在
+        assertTrue(denied.next(running = false, err = null, now = t0 + q).broken)
+        // 后台检查到通道在跑 = 恢复:卡片消失
+        assertFalse(denied.next(running = true, err = null, now = t0 + q).broken)
+    }
+
+    @Test
     fun rememberedIdsAreBounded() {
         assertEquals(listOf(1, 2, 3), rememberIds(listOf(1, 2), listOf(2, 3)))
         val many = rememberIds((1..250).toList(), listOf(251))
