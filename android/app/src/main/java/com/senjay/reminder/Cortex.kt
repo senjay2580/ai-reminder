@@ -132,9 +132,13 @@ fun reminderPayload(tasks: List<Task>, now: LocalDateTime): JSONObject = JSONObj
     ),
 )
 
+/** 指令要改的是哪条:带 push 的先找「由推送 #push 建的那条」,找不到再按 id(网页 id / 本机数字 id)找。 */
+private fun List<Task>.target(d: JSONObject, key: String): Task? =
+    (if (d.isNull("push")) null else d.getInt("push"))?.let { n -> find { it.push == n } } ?: find { key.isNotEmpty() && it.key == key }
+
 /**
- * reminder_upsert:按 id 找到就原地改(铃声、来源推送保留),找不到就按这个 id 新建
- * (数字 id 且没被占用就直接用它当本机 id,否则记进 cid)。内容不对抛 IllegalArgumentException。
+ * reminder_upsert:找到目标(见 target)就原地改,本机 id / 网页 id / 铃声 / 来源推送都不变;
+ * 找不到就按这个 id 新建(数字 id 且没被占用就直接用它当本机 id,否则记进 cid)。内容不对抛 IllegalArgumentException。
  */
 fun List<Task>.upsert(d: JSONObject, zone: ZoneId = ZoneId.systemDefault()): List<Task> {
     val key = d.optString("id").trim()
@@ -144,7 +148,7 @@ fun List<Task>.upsert(d: JSONObject, zone: ZoneId = ZoneId.systemDefault()): Lis
     require(!d.isNull("time")) { "缺时间" }
     val at = LocalDateTime.ofInstant(Instant.ofEpochSecond(d.getDouble("time").toLong()), zone) // 重复提醒只取时分
     val rep = d.optString("repeat").trim().ifEmpty { "once" }
-    val old = find { it.key == key }
+    val old = target(d, key)
     val id = old?.id ?: key.toIntOrNull()?.takeIf { n -> n > 0 && none { it.id == n } } ?: nextId(this)
     val base = Task(
         id = id,
@@ -154,7 +158,7 @@ fun List<Task>.upsert(d: JSONObject, zone: ZoneId = ZoneId.systemDefault()): Lis
         enabled = d.optBoolean("enabled", true),
         sound = old?.sound,
         push = old?.push,
-        cid = if (id.toString() == key) null else key,
+        cid = if (old != null) old.cid else if (id.toString() == key) null else key,
     )
     val t = when {
         rep == "once" -> base.copy(date = at.toLocalDate())
@@ -171,8 +175,13 @@ fun List<Task>.upsert(d: JSONObject, zone: ZoneId = ZoneId.systemDefault()): Lis
     return if (old != null) map { if (it.id == old.id) t else it } else this + t
 }
 
-/** reminder_delete:按 id 删;本机已经没有了就什么都不变。 */
-fun List<Task>.removeKey(key: String): List<Task> = filter { it.key != key }
+/** reminder_delete:按 push / id 找到就删(网页 cx id、本机数字 id 都认);本机已经没有了就什么都不变。 */
+fun List<Task>.delete(d: JSONObject): List<Task> {
+    val key = d.optString("id").trim()
+    require(key.isNotEmpty() || !d.isNull("push")) { "缺 id" }
+    val t = target(d, key) ?: return this
+    return filter { it.id != t.id }
+}
 
 /** 推送里的站内链接(/#/feed?…)补上服务器地址;空 = 点通知只打开本应用。 */
 fun pushLink(url: String, base: String): String? = when {
@@ -364,11 +373,10 @@ object Cortex {
             Plan.Upsert, Plan.Delete -> try {
                 val d = JSONObject(p.data.ifBlank { "{}" })
                 val tasks = Store.load(ctx)
-                Store.put(
-                    ctx,
-                    if (plan == Plan.Upsert) tasks.upsert(d)
-                    else tasks.removeKey(d.optString("id").also { require(it.isNotBlank()) { "缺 id" } }),
-                )
+                val after = if (plan == Plan.Upsert) tasks.upsert(d) else tasks.delete(d)
+                Store.put(ctx, after)
+                // Cortex 新建的(Agent 设的、到点提醒、网页新建)告诉一声;改 / 删不打扰
+                after.filter { a -> tasks.none { it.id == a.id } }.takeIf { it.isNotEmpty() }?.let { Notices.created(ctx, it) }
             } catch (e: IllegalArgumentException) {
                 badEdit(ctx, p, e)
             } catch (e: JSONException) {

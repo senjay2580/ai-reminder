@@ -184,12 +184,34 @@ class CortexTest {
     }
 
     @Test
-    fun deleteByKey() {
+    fun deleteByIdOrPush() {
         val web = mine + Task(4, "开会", time = LocalTime.of(9, 0), date = LocalDate.of(2026, 10, 25), cid = "cxab12")
-        assertEquals(listOf(1, 4), web.removeKey("3").map { it.id })
-        assertEquals(listOf(1, 3), web.removeKey("cxab12").map { it.id })
-        assertEquals(web, web.removeKey("cx-gone")) // 本机已经没有了:原样不动
-        assertEquals(web, web.removeKey("4")) // 网页建的那条只认 cx id,不会被数字 id 误删
+        fun del(id: String, push: Int? = null) = web.delete(JSONObject().put("id", id).put("push", push ?: JSONObject.NULL)).map { it.id }
+        assertEquals(listOf(1, 4), del("3")) // 本机数字 id
+        assertEquals(listOf(1, 3), del("cxab12")) // 网页 cx id
+        assertEquals(listOf(1, 4), del("cx-other", push = 9)) // 「由推送 #9 建的那条」= 3
+        assertEquals(listOf(1, 3), del("cxab12", push = 99)) // 没有推送 #99 建的,退回按 id
+        assertEquals(listOf(1, 3, 4), del("cx-gone")) // 本机已经没有了:原样不动
+        assertEquals(listOf(1, 3, 4), del("4")) // 网页建的那条只认 cx id,不会被数字 id 误删
+        assertThrows(IllegalArgumentException::class.java) { web.delete(JSONObject()) }
+    }
+
+    @Test
+    fun upsertWithPushEditsThatOneInsteadOfCreating() {
+        val at = LocalDateTime.of(2026, 10, 26, 14, 0)
+        val after = mine.upsert(edit("cx77", "交作业（改）", at, "once").put("push", 9), zone)
+        assertEquals(listOf(1, 3), after.map { it.id }) // 改的是推送 #9 建的那条,没多出一条
+        val t = after[1]
+        assertEquals("交作业（改）", t.title)
+        assertEquals(at.toLocalDate(), t.date)
+        assertTrue(t.days.isEmpty())
+        assertEquals("3", t.key) // 身份不变:之后按 push 或原 id 都还能找到它
+        assertEquals(9, t.push)
+        assertEquals("s", t.sound)
+        // 没有推送 #99 建的:退回按 id 找,也没有 → 新建
+        val created = mine.upsert(edit("cx77", "新的", at, "once").put("push", 99), zone)
+        assertEquals("cx77", created.last().key)
+        assertNull(created.last().push)
     }
 
     @Test
