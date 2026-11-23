@@ -24,7 +24,7 @@ class CortexTest {
             """{"id": 2, "kind": "alarm", "title": "提醒交作业", "body": "b", "at": 1792910400.0, "url": "",
                "event_id": "efe68c26c1a", "note": "", "created": 1792674012.4967556, "acked": null}""",
         )
-        assertEquals(Push(2, "alarm", "提醒交作业", "b", 1_792_910_400L, "", false), Push.fromJson(o))
+        assertEquals(Push(2, "alarm", "提醒交作业", "b", 1_792_910_400L, "", false, created = 1_792_674_012L), Push.fromJson(o))
         val n = Push.fromJson(JSONObject("""{"id": 3, "kind": "notify", "title": "t", "body": null, "at": null, "url": "/#/feed?item=x", "acked": 1792674300.6}"""))
         assertNull(n.at)
         assertEquals("", n.body) // JSON null 不能变成字符串 "null"

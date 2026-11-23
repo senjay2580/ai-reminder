@@ -62,6 +62,7 @@ data class Push(
     val url: String,
     val acked: Boolean,
     val data: String = "",
+    val created: Long? = null,
 ) {
     companion object {
         fun fromJson(o: JSONObject) = Push(
@@ -73,6 +74,7 @@ data class Push(
             url = o.optStringOrNull("url") ?: "",
             acked = !o.isNull("acked"),
             data = o.optStringOrNull("data") ?: "",
+            created = if (o.isNull("created")) null else o.getDouble("created").toLong(),
         )
     }
 }
@@ -416,7 +418,9 @@ object Cortex {
         Log.i(TAG, "推送 #${p.id} ${p.kind} → $plan")
         when (plan) {
             Plan.Skip -> Unit
-            Plan.Notify -> Notices.cortex(ctx, p.id, p.title, p.body, pushLink(p.url, base(ctx)))
+            Plan.Notify -> if (Inbox.receive(ctx, p)) {
+                Notices.cortex(ctx, p.id, p.title, p.body, pushLink(p.url, base(ctx)), inboxKey = "${base(ctx)}#${p.id}")
+            }
             is Plan.Missed -> Notices.cortex(
                 ctx, p.id, "错过的闹钟：${p.title}",
                 "原定 ${whenText(local(plan.at), local(now))}，收到时已晚 ${(now - plan.at) / 60} 分钟，没有补响" +

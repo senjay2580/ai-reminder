@@ -44,6 +44,8 @@ object Notices {
 
     fun cancelUpcoming(ctx: Context, id: Int) = nm(ctx).cancel(UPCOMING_BASE + id)
 
+    fun cancelCortex(ctx: Context, message: InboxMessage) = nm(ctx).cancel(message.key, CORTEX_BASE + message.id)
+
     fun created(ctx: Context, tasks: List<Task>) {
         nm(ctx).createNotificationChannel(NotificationChannel(CH_CREATED, "新建提醒", NotificationManager.IMPORTANCE_DEFAULT))
         val text = tasks.joinToString("\n") { it.summary() }
@@ -60,15 +62,22 @@ object Notices {
         )
     }
 
-    /** Cortex 推来的通知(或错过的闹钟);点开跳 link,没有就打开本应用。 */
-    fun cortex(ctx: Context, pushId: Int, title: String, text: String, link: String?) {
+    /** 普通 Cortex 消息打开信箱详情，错过的闹钟沿用原来的跳转。 */
+    fun cortex(ctx: Context, pushId: Int, title: String, text: String, link: String?, inboxKey: String? = null) {
         nm(ctx).createNotificationChannel(NotificationChannel(CH_CORTEX, "Cortex 推送", NotificationManager.IMPORTANCE_DEFAULT))
-        val tap = if (link == null) open(ctx) else PendingIntent.getActivity(
+        val tap = if (inboxKey != null) PendingIntent.getActivity(
+            ctx, CORTEX_BASE + pushId,
+            Intent(ctx, MainActivity::class.java).setAction(Inbox.OPEN).putExtra(Inbox.KEY, inboxKey)
+                .setData(Uri.parse("aireminder://inbox/${Uri.encode(inboxKey)}"))
+                .addFlags(Intent.FLAG_ACTIVITY_CLEAR_TOP or Intent.FLAG_ACTIVITY_SINGLE_TOP),
+            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE,
+        ) else if (link == null) open(ctx) else PendingIntent.getActivity(
             ctx, CORTEX_BASE + pushId,
             Intent(Intent.ACTION_VIEW, Uri.parse(link)).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK),
             PendingIntent.FLAG_IMMUTABLE,
         )
         nm(ctx).notify(
+            inboxKey,
             CORTEX_BASE + pushId,
             Notification.Builder(ctx, CH_CORTEX)
                 .setSmallIcon(R.drawable.ic_bell)

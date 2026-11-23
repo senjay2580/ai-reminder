@@ -56,9 +56,12 @@ import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.automirrored.filled.List
 import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.DateRange
+import androidx.compose.material.icons.filled.Notifications
 import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
+import androidx.compose.material3.Badge
+import androidx.compose.material3.BadgedBox
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.ExperimentalMaterial3Api
@@ -118,13 +121,14 @@ import java.time.ZoneId
 class MainActivity : ComponentActivity() {
     private val resumes = mutableIntStateOf(0)
     private val pairing = mutableStateOf<Pair<String, String>?>(null) // 一键连接链接指向别的服务器:先问一句
+    private val inboxRequest = mutableStateOf<String?>(null)
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         enableEdgeToEdge()
         setContent {
             AppTheme {
-                App(resumes.intValue)
+                App(resumes.intValue, inboxRequest.value, onInboxOpened = { inboxRequest.value = null })
                 pairing.value?.let { (server, token) ->
                     PairDialog(server, onConnect = { pairing.value = null; pair(server, token) }, onCancel = { pairing.value = null })
                 }
@@ -143,6 +147,10 @@ class MainActivity : ComponentActivity() {
      * 和当前设置的是同一台服务器就直接连;换到别的服务器要先确认——那边能推闹钟、能看到全部提醒。
      */
     private fun openLink(intent: Intent?) {
+        if (intent?.action == Inbox.OPEN) {
+            inboxRequest.value = intent.getStringExtra(Inbox.KEY)
+            return
+        }
         val link = intent?.takeIf { it.action == Intent.ACTION_VIEW }?.dataString ?: return
         val (server, token) = try {
             parsePairLink(link)
@@ -182,11 +190,13 @@ fun toast(ctx: Context, s: String) = Toast.makeText(ctx, s, Toast.LENGTH_LONG).s
 private fun packageUri(ctx: Context) = Uri.parse("package:${ctx.packageName}")
 
 @Composable
-fun App(resumes: Int) {
+fun App(resumes: Int, inboxRequest: String?, onInboxOpened: () -> Unit) {
     val ctx = LocalContext.current
     var tasks by remember { mutableStateOf(Store.load(ctx)) }
     var missed by remember { mutableStateOf(emptyList<Task>()) }
     LaunchedEffect(resumes) {
+        Inbox.start(ctx)
+        Inbox.clean(ctx)
         val all = Store.load(ctx)
         Alarms.missed(all, Alarms.expected(ctx), System.currentTimeMillis()).takeIf { it.isNotEmpty() }?.let { missed = it }
         all.forEach { Alarms.schedule(ctx, it) } // 清理后台 / 强行停止会连带取消系统闹钟,回到前台就全部重排
@@ -204,6 +214,19 @@ fun App(resumes: Int) {
     val rev = Store.rev.intValue
     LaunchedEffect(rev) { tasks = Store.load(ctx) }
     var settings by rememberSaveable { mutableStateOf(false) }
+    var inbox by rememberSaveable { mutableStateOf(false) }
+    var inboxKey by rememberSaveable { mutableStateOf<String?>(null) }
+    val inboxRev = Inbox.rev.intValue
+    var messages by remember { mutableStateOf(Inbox.load(ctx)) }
+    LaunchedEffect(inboxRev, resumes) { messages = Inbox.load(ctx) }
+    LaunchedEffect(inboxRequest) {
+        if (inboxRequest != null) {
+            inboxKey = inboxRequest
+            inbox = true
+            settings = false
+            onInboxOpened()
+        }
+    }
     LaunchedEffect(settings) { if (!settings) Cortex.start(ctx) } // 设置里改了 Cortex 地址 / 令牌,回到主页时按新的生效
     var update by remember { mutableStateOf<Updater.Release?>(null) }
 
@@ -226,8 +249,14 @@ fun App(resumes: Int) {
     if (settings) {
         BackHandler { settings = false }
         SettingsScreen(onBack = { settings = false }, onUpdate = { update = it })
+    } else if (inbox) {
+        BackHandler { inbox = false }
+        InboxScreen(messages, resumes, inboxKey, onKeyHandled = { inboxKey = null }, onBack = { inbox = false })
     } else {
-        MainScreen(tasks, resumes, commit, missed, onMissedSeen = { missed = emptyList() }, onSettings = { settings = true })
+        MainScreen(
+            tasks, resumes, commit, missed, onMissedSeen = { missed = emptyList() }, onSettings = { settings = true },
+            unread = messages.count { !it.read }, onInbox = { inbox = true },
+        )
     }
     update?.let { UpdateDialog(it) { update = null } }
 }
@@ -240,6 +269,8 @@ fun MainScreen(
     missed: List<Task>,
     onMissedSeen: () -> Unit,
     onSettings: () -> Unit,
+    unread: Int,
+    onInbox: () -> Unit,
 ) {
     val ctx = LocalContext.current
     var editing by remember { mutableStateOf<Task?>(null) }
@@ -289,6 +320,11 @@ fun MainScreen(
             TopAppBar(
                 title = { Text("AI提醒") },
                 actions = {
+                    IconButton(onInbox) {
+                        BadgedBox(badge = { if (unread > 0) Badge { Text(if (unread > 99) "99+" else unread.toString()) } }) {
+                            Icon(Icons.Default.Notifications, "通知信箱，$unread 条未读")
+                        }
+                    }
                     IconButton({ calendar = !calendar }) {
                         if (calendar) Icon(Icons.AutoMirrored.Filled.List, "列表") else Icon(Icons.Default.DateRange, "日历")
                     }
