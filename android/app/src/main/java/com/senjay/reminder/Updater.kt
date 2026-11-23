@@ -13,18 +13,24 @@ import java.io.IOException
 import java.net.HttpURLConnection
 import java.net.URL
 
-/** 查公开仓库最新 Release(免 token),下载 APK 交给系统安装器覆盖安装(同签名所以数据保留)。 */
+/** 读取 Release 的静态更新文件，下载 APK 交给系统安装器覆盖安装。 */
 object Updater {
-    private const val API = "https://api.github.com/repos/senjay2580/ai-reminder/releases/latest"
+    // 公开 API 按出口 IP 限制每小时 60 次，手机代理的共享出口容易耗尽；静态 Release 资产没有这项 API 限额。
+    private const val MANIFEST = "https://github.com/senjay2580/ai-reminder/releases/latest/download/update.json"
 
     data class Release(val version: String, val notes: String, val apkUrl: String)
 
     suspend fun latest(): Release = withContext(Dispatchers.IO) {
-        val o = JSONObject(open(API, "application/vnd.github+json").inputStream.bufferedReader().use { it.readText() })
-        val assets = o.getJSONArray("assets")
-        val apk = (0 until assets.length()).map(assets::getJSONObject).firstOrNull { it.getString("name").endsWith(".apk") }
-            ?: throw IOException("最新 Release 里没有 APK")
-        Release(o.getString("tag_name").removePrefix("v"), o.optString("body"), apk.getString("browser_download_url"))
+        val c = open(MANIFEST, "application/json")
+        try {
+            parseRelease(c.inputStream.bufferedReader(Charsets.UTF_8).use { it.readText() })
+        } finally {
+            c.disconnect()
+        }
+    }
+
+    fun parseRelease(text: String): Release = JSONObject(text).let { o ->
+        Release(o.getString("version").removePrefix("v"), o.optStringOrNull("notes") ?: "", o.getString("apkUrl"))
     }
 
     fun isNewer(remote: String, local: String): Boolean {
@@ -84,11 +90,17 @@ object Updater {
             connectTimeout = 15_000
             readTimeout = 30_000
             setRequestProperty("Accept", accept)
+            setRequestProperty("User-Agent", "AiReminder/${BuildConfig.VERSION_NAME}")
         }
-        if (c.responseCode !in 200..299) {
-            // 未登录访问有每小时 60 次的限额,超了会回 403
-            throw IOException("HTTP ${c.responseCode} ${c.errorStream?.bufferedReader()?.use { it.readText().take(200) }}")
+        try {
+            if (c.responseCode !in 200..299) {
+                val text = c.errorStream?.bufferedReader()?.use { it.readText().take(200) }.orEmpty()
+                throw IOException("HTTP ${c.responseCode} $text")
+            }
+            return c
+        } catch (e: Exception) {
+            c.disconnect()
+            throw e
         }
-        return c
     }
 }

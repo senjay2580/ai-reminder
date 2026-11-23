@@ -10,8 +10,9 @@ git push
 git tag v1.2.0 && git push origin v1.2.0
 ```
 
-推 tag 后 GitHub Actions 跑单测 → 构建 → 发 Release（约 3–4 分钟）。版本号由 tag 决定，不用手改 `build.gradle.kts`。
+推 tag 后 GitHub Actions 跑单测 → 构建 → 发 Release（约 3–4 分钟）。版本号由 tag 决定，不用手改 `build.gradle.kts`。Release 同时发布 `update.json`，包含版本、说明和 APK 地址，应用从 `releases/latest/download/update.json` 检查更新，避开匿名 API 按出口 IP 每小时 60 次的限流。手机仍需能访问 GitHub。
 仓库是公开的，APP 检查更新、下载都不需要任何 token；下载后弹出系统安装界面，点「安装」即覆盖（同签名，数据保留）。
+v1.5.0 及之前的更新检查仍走 GitHub API；出现 `API rate limit exceeded` 时，从 GitHub Release 手动下载 v1.5.1 或之后的 APK，覆盖安装一次后即可使用新的检查通道。
 
 ## 签名与密钥
 
