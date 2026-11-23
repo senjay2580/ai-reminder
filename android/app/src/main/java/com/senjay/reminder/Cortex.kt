@@ -8,6 +8,9 @@ import android.app.PendingIntent
 import android.app.Service
 import android.content.Context
 import android.content.Intent
+import android.net.ConnectivityManager
+import android.net.Network
+import android.net.NetworkCapabilities
 import android.os.IBinder
 import android.os.PowerManager
 import android.os.SystemClock
@@ -29,7 +32,9 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
+import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
@@ -218,8 +223,8 @@ fun serverError(code: Int, body: String): String {
     return if (msg.isNotBlank()) "$msg（HTTP $code）" else "HTTP $code ${body.take(200)}"
 }
 
-/** 连续失败第 n 次后等多久:5 秒起翻倍,封顶 5 分钟。 */
-fun backoffMs(fails: Int): Long = minOf(5 * 60_000L, 5_000L shl (fails - 1).coerceIn(0, 6))
+/** 连续失败第 n 次后等多久:5 秒起翻倍,封顶 30 秒，网络恢复事件会提前唤醒。 */
+fun backoffMs(fails: Int): Long = minOf(30_000L, 5_000L shl (fails - 1).coerceIn(0, 3))
 
 /** 处理过的推送 id 只留最近 200 个:够判重(ack 没送到的 24 小时内会被推回来),又不无限长。 */
 fun rememberIds(done: List<Int>, ids: List<Int>): List<Int> = (done + ids).distinct().takeLast(200)
@@ -369,10 +374,10 @@ object Cortex {
     }
 
     /** wait = 长轮询:有新推送立刻返回,没有就挂 ~50 秒。 */
-    fun fetch(ctx: Context, wait: Boolean): List<Push> {
+    fun fetch(ctx: Context, wait: Boolean, active: PollConnection? = null): List<Push> {
         val after = sp(ctx).getInt("last", 0)
         val path = if (wait) "/api/device/wait?after=$after&timeout=50" else "/api/device/pull?after=$after"
-        val a = call(ctx, path, readMs = if (wait) 75_000 else 30_000).getJSONArray("items")
+        val a = call(ctx, path, readMs = if (wait) 75_000 else 30_000, active = active).getJSONArray("items")
         return (0 until a.length()).map { Push.fromJson(a.getJSONObject(it)) }
     }
 
@@ -496,13 +501,14 @@ object Cortex {
 
     private fun local(s: Long) = LocalDateTime.ofInstant(Instant.ofEpochSecond(s), ZoneId.systemDefault())
 
-    private fun call(ctx: Context, path: String, body: JSONObject? = null, readMs: Int = 30_000): JSONObject =
-        http(base(ctx) + path, body, mapOf("Authorization" to "Bearer " + Prefs.get(ctx, Prefs.CORTEX_TOKEN)), readMs).json
+    private fun call(ctx: Context, path: String, body: JSONObject? = null, readMs: Int = 30_000, active: PollConnection? = null): JSONObject =
+        http(base(ctx) + path, body, mapOf("Authorization" to "Bearer " + Prefs.get(ctx, Prefs.CORTEX_TOKEN)), readMs, active).json
 
     private class Resp(val json: JSONObject, val cookies: List<String>)
 
-    private fun http(url: String, body: JSONObject?, headers: Map<String, String>, readMs: Int = 30_000): Resp {
+    private fun http(url: String, body: JSONObject?, headers: Map<String, String>, readMs: Int = 30_000, active: PollConnection? = null): Resp {
         val c = URL(url).openConnection() as HttpURLConnection
+        active?.opened(c)
         try {
             c.connectTimeout = 15_000
             c.readTimeout = readMs
@@ -519,6 +525,7 @@ object Cortex {
             val cookies = c.headerFields.filterKeys { it?.equals("Set-Cookie", ignoreCase = true) == true }.values.flatten()
             return Resp(JSONObject(text), cookies)
         } finally {
+            active?.finished(c)
             c.disconnect()
         }
     }
@@ -531,6 +538,37 @@ object Cortex {
 class CortexService : Service() {
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private var loop: Job? = null
+    private val active = PollConnection()
+    private val connectivity get() = getSystemService(ConnectivityManager::class.java)
+    private val networkCallback = object : ConnectivityManager.NetworkCallback() {
+        private var connected: Network? = null
+
+        override fun onCapabilitiesChanged(network: Network, capabilities: NetworkCapabilities) {
+            val available = network.takeIf {
+                capabilities.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET) &&
+                    capabilities.hasCapability(NetworkCapabilities.NET_CAPABILITY_VALIDATED)
+            }
+            if (connected != available) {
+                connected = available
+                reconnect()
+            }
+        }
+
+        override fun onLost(network: Network) {
+            if (connected == network) {
+                connected = null
+                reconnect()
+            }
+        }
+    }
+
+    override fun onCreate() {
+        super.onCreate()
+        connectivity.registerDefaultNetworkCallback(networkCallback)
+    }
+
+    /** 网络恢复/切换主动打断旧连接和退避，唤醒现有循环继续收信。 */
+    private fun reconnect() = active.reconnect()
 
     override fun onBind(intent: Intent?): IBinder? = null
 
@@ -562,28 +600,37 @@ class CortexService : Service() {
 
     override fun onDestroy() {
         running = false
+        connectivity.unregisterNetworkCallback(networkCallback)
         scope.cancel()
+        active.close()
         super.onDestroy()
     }
 
     // ponytail: 不持 WakeLock(全天持有太耗电)。深度休眠时 CPU 停了,长轮询可能晚到;靠 15 分钟兜底和回到前台补拉
     private suspend fun poll() {
         var fails = 0
-        while (scope.isActive) { // 请求是阻塞的、不响应取消,服务停了要靠这里退出
+        while (currentCoroutineContext().isActive) {
             if (!Cortex.ready(this)) return stopSelf()
+            if (active.changed()) fails = 0
             try {
                 val started = System.currentTimeMillis()
-                val items = Cortex.fetch(this, wait = true)
+                val items = Cortex.fetch(this, wait = true, active = active)
+                currentCoroutineContext().ensureActive()
                 Cortex.handle(this, items)
                 Cortex.ok(this)
                 fails = 0
                 // 服务端没挂住就空手返回(地址填错成别的服务之类):别变成每秒打一次的死循环
-                if (items.isEmpty() && System.currentTimeMillis() - started < 5_000) delay(30_000)
+                if (items.isEmpty() && System.currentTimeMillis() - started < 5_000) active.pause(30_000)
             } catch (e: CancellationException) {
                 throw e
             } catch (e: Exception) {
+                currentCoroutineContext().ensureActive()
+                if (active.changed()) {
+                    fails = 0
+                    continue // 主动关闭旧连接引起的异常，马上用当前网络重新拉取
+                }
                 Cortex.fail(this, e)
-                delay(backoffMs(++fails))
+                if (active.pause(backoffMs(++fails))) fails = 0
             }
         }
     }

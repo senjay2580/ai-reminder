@@ -104,10 +104,10 @@ class CortexTest {
     }
 
     @Test
-    fun backoffDoublesAndCapsAtFiveMinutes() {
-        assertEquals(listOf(5_000L, 10_000L, 20_000L, 40_000L), (1..4).map(::backoffMs))
-        assertEquals(300_000L, backoffMs(7))
-        assertEquals(300_000L, backoffMs(1000))
+    fun backoffDoublesAndCapsAtThirtySeconds() {
+        assertEquals(listOf(5_000L, 10_000L, 20_000L, 30_000L), (1..4).map(::backoffMs))
+        assertEquals(30_000L, backoffMs(7))
+        assertEquals(30_000L, backoffMs(1000))
     }
 
     @Test
